@@ -4,15 +4,12 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Ultrasonic Chat</title>
-    <!-- quiet.js dependencies -->
-    <script src="https://cdn.jsdelivr.net/npm/quiet-js@1.0.0/quiet.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/quiet-js@1.0.0/quiet-profiles.js"></script>
     <style>
         * { margin:0; padding:0; box-sizing:border-box; }
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height:100vh; display:flex; justify-content:center; align-items:center; padding:20px;
+            height:100vh; display:flex; justify-content:center; align-items:center; padding:20px;
         }
         .app {
             background:white; border-radius:20px; width:100%; max-width:480px;
@@ -20,225 +17,184 @@
             box-shadow:0 20px 60px rgba(0,0,0,0.3); overflow:hidden;
         }
         h1 { background:linear-gradient(135deg,#667eea,#764ba2); color:white;
-             padding:16px; text-align:center; font-size:20px; }
-        .statusbar {
-            display:flex; justify-content:space-around; padding:10px;
-            background:#f5f5f5; border-bottom:1px solid #ddd; font-size:12px;
-            align-items:center;
-        }
+             padding:16px; text-align:center; font-size:20px; margin:0; }
+        .statusbar { display:flex; justify-content:space-around; padding:10px;
+                     background:#f5f5f5; border-bottom:1px solid #ddd; font-size:12px; align-items:center; }
         .dot { width:9px; height:9px; border-radius:50%; background:#ccc;
                display:inline-block; margin-right:5px; transition:background .2s; }
-        .dot.on  { background:#28a745; }
-        .dot.err { background:#dc3545; }
-        .dot.busy { background:#ffc107; }
+        .dot.on   { background:#28a745; }
+        .dot.err  { background:#dc3545; }
+        .dot.busy { background:#ffc107; animation: blink 0.5s infinite; }
+        @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
         .messages { flex:1; overflow-y:auto; padding:16px; background:#f8f9fa; }
         .bubble { max-width:75%; padding:10px 14px; border-radius:16px;
                   margin-bottom:10px; word-break:break-word; line-height:1.4; }
         .sent     { background:linear-gradient(135deg,#667eea,#764ba2); color:white; margin-left:auto; }
         .received { background:white; color:#333; box-shadow:0 2px 6px rgba(0,0,0,0.12); }
-        .system   { text-align:center; color:#999; font-size:12px; margin:8px 0; }
+        .sys      { text-align:center; color:#999; font-size:12px; margin:6px 0; font-style:italic; }
         .debug { height:110px; overflow-y:auto; background:#111; color:#0f0;
                  font-family:monospace; font-size:10px; padding:8px; border-top:1px solid #333; }
         .inputbar { display:flex; gap:8px; padding:12px; background:white; border-top:1px solid #eee; }
         input { flex:1; padding:10px 14px; border:2px solid #eee; border-radius:20px;
                 outline:none; font-size:14px; }
         input:focus { border-color:#667eea; }
-        input:disabled { background:#f5f5f5; color:#999; }
-        button.send {
+        input:disabled { background:#f5f5f5; }
+        .btn-send {
             background:linear-gradient(135deg,#667eea,#764ba2); color:white;
             border:none; border-radius:50%; width:42px; height:42px;
             cursor:pointer; font-size:18px; flex-shrink:0;
         }
-        button.send:disabled { opacity:0.4; cursor:not-allowed; }
-        .init-overlay {
-            position:fixed; inset:0; background:rgba(0,0,0,0.5);
+        .btn-send:disabled { opacity:0.4; cursor:not-allowed; }
+        .overlay {
+            position:fixed; inset:0; background:rgba(0,0,0,0.55);
             display:flex; justify-content:center; align-items:center; z-index:999;
         }
-        .init-box {
-            background:white; border-radius:20px; padding:30px;
+        .overlay-box {
+            background:white; border-radius:20px; padding:32px 28px;
             text-align:center; max-width:340px; width:90%;
-            box-shadow:0 20px 60px rgba(0,0,0,0.4);
         }
-        .init-box h2 { margin-bottom:12px; color:#333; }
-        .init-box p  { color:#666; font-size:14px; margin-bottom:20px; line-height:1.5; }
-        .init-box button {
+        .overlay-box h2 { margin-bottom:10px; }
+        .overlay-box p  { color:#666; font-size:14px; line-height:1.6; margin-bottom:20px; }
+        .overlay-box button {
             background:linear-gradient(135deg,#667eea,#764ba2); color:white;
-            border:none; border-radius:25px; padding:14px 32px;
-            font-size:16px; font-weight:600; cursor:pointer;
-            box-shadow:0 6px 20px rgba(102,126,234,0.4);
+            border:none; border-radius:25px; padding:14px 36px;
+            font-size:17px; font-weight:600; cursor:pointer;
         }
     </style>
 </head>
 <body>
-
 <div class="app">
     <h1>💬 Ultrasonic Chat</h1>
     <div class="statusbar">
         <span><span class="dot busy" id="dTx"></span>TX</span>
         <span><span class="dot busy" id="dRx"></span>RX</span>
-        <span id="statusText" style="font-size:11px;color:#666;">Initializing...</span>
+        <span id="stText" style="font-size:11px;color:#888;">Loading...</span>
     </div>
     <div class="messages" id="msgs">
-        <div class="system">Loading quiet.js — please wait...</div>
+        <div class="sys" id="ph">Initializing quiet.js…</div>
     </div>
     <div class="debug" id="dbg"></div>
     <div class="inputbar">
-        <input id="txt" placeholder="Waiting for quiet.js..." maxlength="100" disabled>
-        <button class="send" id="sendBtn" onclick="send()" disabled>📤</button>
+        <input id="txt" placeholder="Loading…" disabled maxlength="200">
+        <button class="btn-send" id="btnSend" disabled onclick="sendMsg()">📤</button>
     </div>
 </div>
 
-<!-- Start overlay -->
-<div class="init-overlay" id="overlay">
-    <div class="init-box">
+<div class="overlay" id="overlay">
+    <div class="overlay-box">
         <h2>🔊 Ultrasonic Chat</h2>
-        <p>Transmit text silently between devices using ~19kHz ultrasonic tones.<br><br>
-           <strong>Use Chrome</strong> for best results.<br>
-           Keep devices 0.5–2m apart, speaker at max volume.</p>
+        <p>Sends text silently between devices using ~19kHz ultrasonic sound.<br><br>
+           <strong>Chrome only</strong> (Firefox cannot receive ultrasonic).<br>
+           Max speaker volume on transmitting device.</p>
         <button onclick="startApp()">🎤 Start Chat</button>
     </div>
 </div>
 
+<!-- quiet.js — load from GitHub Pages (correct file order) -->
+<script src="https://quiet.github.io/quiet-js/quiet.js"></script>
+<script async src="https://quiet.github.io/quiet-js/quiet-emscripten.js"></script>
+
 <script>
-// ─── Logging ────────────────────────────────────
-function log(msg) {
+// ── Helpers ───────────────────────────────────
+function log(s) {
     const d = document.getElementById('dbg');
-    const t = new Date().toLocaleTimeString('en', {hour12:false});
-    d.textContent = t + ' ' + msg + '\n' + d.textContent;
+    const t = new Date().toLocaleTimeString('en',{hour12:false});
+    d.textContent = t + ' ' + s + '\n' + d.textContent;
     d.textContent = d.textContent.split('\n').slice(0,30).join('\n');
-    console.log(msg);
+    console.log(s);
 }
-
-function sysMsg(text) {
-    const div = document.createElement('div');
-    div.className = 'system';
-    div.textContent = text;
-    const msgs = document.getElementById('msgs');
-    msgs.appendChild(div);
-    msgs.scrollTop = msgs.scrollHeight;
+function sysMsg(s) {
+    const el = document.createElement('div');
+    el.className = 'sys'; el.textContent = s;
+    const m = document.getElementById('msgs');
+    m.appendChild(el); m.scrollTop = m.scrollHeight;
 }
-
 function addBubble(text, cls) {
-    const div = document.createElement('div');
-    div.className = 'bubble ' + cls;
-    div.textContent = text;
-    const msgs = document.getElementById('msgs');
-    // remove placeholder
-    msgs.querySelectorAll('.system').forEach(e => {
-        if (e.textContent.includes('Loading')) e.remove();
-    });
-    msgs.appendChild(div);
-    msgs.scrollTop = msgs.scrollHeight;
+    const ph = document.getElementById('ph');
+    if (ph) ph.remove();
+    const el = document.createElement('div');
+    el.className = 'bubble ' + cls; el.textContent = text;
+    const m = document.getElementById('msgs');
+    m.appendChild(el); m.scrollTop = m.scrollHeight;
 }
-
-function setStatus(text) {
-    document.getElementById('statusText').textContent = text;
+function dot(id, state) {
+    document.getElementById(id).className = 'dot ' + state;
 }
+function status(s) { document.getElementById('stText').textContent = s; }
 
-function setDot(id, state) {
-    const d = document.getElementById(id);
-    d.className = 'dot ' + state; // on, off, busy, err
-}
-
-// ─── Quiet.js setup ─────────────────────────────
+// ── quiet.js ─────────────────────────────────
 let transmitter = null;
-let receiver    = null;
-let ready       = false;
-
-const PROFILE = 'ultrasonic'; // ~19kHz, inaudible
 
 function startApp() {
     document.getElementById('overlay').remove();
-    log('Starting quiet.js...');
-    setStatus('Loading...');
+    log('Initializing quiet.js...');
+    status('Loading...');
 
-    // quiet.js needs a "profiles" JSON — we point to the CDN version
     Quiet.init({
-        profilesPrefix: 'https://cdn.jsdelivr.net/npm/quiet-js@1.0.0/',
-        memoryInitializerPrefix: 'https://cdn.jsdelivr.net/npm/quiet-js@1.0.0/',
-        libfecPrefix: 'https://cdn.jsdelivr.net/npm/libfec@1.0.2/'
+        profilesPrefix: 'https://quiet.github.io/quiet-js/',
+        memoryInitializerPrefix: 'https://quiet.github.io/quiet-js/',
+        libfecPrefix: 'https://quiet.github.io/quiet-js/'
     });
 
-    Quiet.addReadyCallback(onReady, onFail);
-}
+    Quiet.addReadyCallback(() => {
+        log('quiet.js ready!');
+        status('Ready ✓');
+        dot('dTx', ''); dot('dRx', '');
 
-function onFail(reason) {
-    log('ERROR: ' + reason);
-    setStatus('Error: ' + reason);
-    setDot('dTx', 'err');
-    setDot('dRx', 'err');
-    sysMsg('⚠️ Failed to load quiet.js: ' + reason);
-}
+        // TX
+        transmitter = Quiet.transmitter({
+            profile: 'ultrasonic',
+            onFinish:  () => { log('TX done'); dot('dTx', ''); },
+            onEnqueue: () => { dot('dTx', 'on'); }
+        });
 
-function onReady() {
-    log('quiet.js ready!');
-    setStatus('Ready');
+        // RX
+        Quiet.receiver({
+            profile: 'ultrasonic',
+            onReceive: (payload) => {
+                const text = new TextDecoder().decode(payload);
+                log('RX: ' + text);
+                dot('dRx', 'on');
+                setTimeout(() => dot('dRx', ''), 400);
+                addBubble(text, 'received');
+            },
+            onCreateFail: (reason) => {
+                log('RX fail: ' + reason);
+                dot('dRx', 'err');
+                sysMsg('⚠️ Microphone error: ' + reason);
+            },
+            onReceiveFail: (n) => log('RX decode fail #' + n)
+        });
 
-    // ── Transmitter ────────────────────────────
-    transmitter = Quiet.transmitter({
-        profile: PROFILE,
-        onFinish: () => {
-            log('TX done');
-            setDot('dTx', '');
-        },
-        onEnqueue: () => {
-            setDot('dTx', 'on');
-        }
+        document.getElementById('txt').disabled = false;
+        document.getElementById('txt').placeholder = 'Type a message…';
+        document.getElementById('btnSend').disabled = false;
+        sysMsg('✅ Ready — open on two devices and chat!');
+
+    }, (err) => {
+        log('ERROR: ' + err);
+        status('Error ✗');
+        dot('dTx','err'); dot('dRx','err');
+        sysMsg('⚠️ Failed to load quiet.js: ' + err);
     });
-
-    // ── Receiver ───────────────────────────────
-    Quiet.receiver({
-        profile: PROFILE,
-        onReceive: (payload) => {
-            // payload is a Uint8Array
-            const text = new TextDecoder().decode(payload);
-            log('RX: ' + text);
-            setDot('dRx', 'on');
-            setTimeout(() => setDot('dRx', ''), 300);
-            addBubble(text, 'received');
-        },
-        onCreateFail: (reason) => {
-            log('RX create fail: ' + reason);
-            setDot('dRx', 'err');
-            sysMsg('⚠️ Microphone error: ' + reason);
-        },
-        onReceiveFail: (numFails) => {
-            log('RX decode fail #' + numFails);
-        }
-    });
-
-    setDot('dTx', '');
-    setDot('dRx', '');
-    ready = true;
-
-    // Enable input
-    document.getElementById('txt').disabled = false;
-    document.getElementById('txt').placeholder = 'Type a message...';
-    document.getElementById('sendBtn').disabled = false;
-
-    sysMsg('✅ Ultrasonic chat ready — send a message!');
-    log('TX and RX initialized on profile: ' + PROFILE);
 }
 
-// ─── Send ────────────────────────────────────────
-function send() {
-    if (!ready || !transmitter) { log('Not ready'); return; }
+// ── Send ──────────────────────────────────────
+function sendMsg() {
+    if (!transmitter) return;
     const txt = document.getElementById('txt');
     const text = txt.value.trim();
     if (!text) return;
     txt.value = '';
-
     log('TX: ' + text);
-    const bytes = new TextEncoder().encode(text);
-    transmitter.transmit(bytes);
+    transmitter.transmit(new TextEncoder().encode(text));
     addBubble(text, 'sent');
-    setDot('dTx', 'busy');
+    dot('dTx', 'busy');
 }
 
-// ─── Enter key ───────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('txt').addEventListener('keydown', e => {
-        if (e.key === 'Enter') send();
+        if (e.key === 'Enter') sendMsg();
     });
 });
 </script>
