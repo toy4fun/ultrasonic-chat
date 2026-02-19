@@ -189,6 +189,26 @@
 
   .btn-stop:hover:not(:disabled) { background: #dd3355; }
 
+  .btn-file {
+    background: #9b59b6;
+    color: #fff;
+  }
+
+  .btn-file:hover:not(:disabled) { background: #8e44ad; }
+
+  .msg .file-link {
+    display: inline-block;
+    margin-top: 4px;
+    padding: 4px 10px;
+    background: #2a4a6b;
+    border-radius: 4px;
+    color: #00d4ff;
+    text-decoration: none;
+    font-size: 0.85em;
+  }
+
+  .msg .file-link:hover { background: #345a7e; }
+
   .debug-log {
     font-size: 0.7em;
     color: #556;
@@ -282,6 +302,12 @@
       <option value="16000" selected>16–19.5 kHz (Inaudible)</option>
       <option value="17000">17–20.5 kHz (Ultra-high)</option>
     </select>
+    <label for="toneSelect">Tones:</label>
+    <select id="toneSelect">
+      <option value="1">1 (Slow)</option>
+      <option value="2">2 (Fast)</option>
+      <option value="3" selected>3 (Fastest)</option>
+    </select>
     <span class="freq-warn">All devices must match!</span>
   </div>
 
@@ -299,6 +325,8 @@
   <div class="send-area">
     <input type="text" id="msgInput" placeholder="Type a message..." maxlength="200" />
     <button class="btn-send" id="btnSend">Send</button>
+    <button class="btn-file" id="btnFile">File</button>
+    <input type="file" id="fileInput" style="display:none" />
   </div>
 
   <div class="controls">
@@ -329,94 +357,153 @@
   // ══════════════════════════════════════════════════════════════════
   // FREQUENCY MAP
   // All frequencies are derived from a single bandBase value (Hz).
-  // Layout across the spectrum:
-  //   Ch B [base .. base+1500]  |  gap  |  ACK [+1700]  START [+1800]  STOP [+1900]  |  Ch A [+2000 .. +3500]
+  // Up to 3 channels carry data nibbles in parallel; the user selects
+  // how many (toneCount = 1, 2, or 3). Layout across the spectrum:
+  //
+  //   Ch C [base-2000 .. base-500]      ← used when toneCount ≥ 3
+  //     500 Hz gap
+  //   Ch B [base .. base+1500]          ← used when toneCount ≥ 2
+  //     200 Hz gap
+  //   Markers  ACK [+1700]  START [+1800]  STOP [+1900]
+  //     100 Hz gap
+  //   Ch A [+2000 .. +3500]             ← always used
+  //
+  // Each channel has 16 tone slots (one per nibble 0–15), spaced
+  // FREQ_STEP Hz apart, spanning 1600 Hz of bandwidth.
+  //
+  // Data is serialized as a nibble stream (2 nibbles per byte) and
+  // sent in groups of toneCount nibbles per tone slot:
+  //   1-tone: 1 nibble/slot on Ch A  → 4 bits/slot  (slowest)
+  //   2-tone: 2 nibbles/slot on A+B  → 8 bits/slot  (1 byte/slot)
+  //   3-tone: 3 nibbles/slot on A+B+C → 12 bits/slot (fastest)
+  //
+  // Throughput per slot ≈ TONE_MS_NIBBLE + GAP_MS (default 120 ms):
+  //   1-tone: ~4.2 B/s    2-tone: ~8.3 B/s    3-tone: ~12.5 B/s
   //
   // bandBase (Hz): Starting frequency of Channel B. Controls where the
   //   entire protocol sits in the spectrum. Lower = more reliable but
   //   more audible. Higher = less audible but hardware may roll off.
+  //   At bandBase=16000 the full 3-channel range is 14000–19500 Hz.
   //   Typical values: 12000 (reliable), 14000 (balanced), 16000 (inaudible).
   //   All communicating devices MUST use the same bandBase.
   // ══════════════════════════════════════════════════════════════════
   let bandBase   = 16000;
-  let FREQ_BASE_B, FREQ_ACK, FREQ_START, FREQ_STOP, FREQ_BASE_A;
+  let FREQ_BASE_C, FREQ_BASE_B, FREQ_ACK, FREQ_START, FREQ_STOP, FREQ_BASE_A;
 
   // FREQ_STEP (Hz): Spacing between adjacent tone frequencies within a
-  //   channel. Each nibble (0–15) maps to base + nibble * FREQ_STEP.
+  //   channel. Each nibble (0–15) maps to channelBase + nibble × FREQ_STEP.
   //   Must be large enough for the FFT to resolve (> 2× bin width).
-  //   At FFT 2048 / 44100 Hz, bin width is ~21.5 Hz, so 100 Hz gives
-  //   comfortable separation. Smaller = more tones in less bandwidth
-  //   but higher risk of misdetection.
+  //   At FFT 2048 / 44100 Hz, bin width ≈ 21.5 Hz, so 100 Hz gives
+  //   ~4.6 bins of separation — comfortable margin. Smaller values pack
+  //   more tones into less bandwidth but increase misdetection risk.
   const FREQ_STEP   = 100;
 
   // NUM_NIBBLES: Number of distinct tone frequencies per channel.
-  //   16 = 4 bits per nibble. Two channels transmit high + low nibble
-  //   of each byte simultaneously. Changing this requires matching
-  //   FREQ_STEP and channel bandwidth (NUM_NIBBLES × FREQ_STEP ≤ 1600 Hz).
+  //   16 = 4 bits per nibble (one hex digit). Each channel uses
+  //   NUM_NIBBLES × FREQ_STEP = 1600 Hz of bandwidth. Payload bytes
+  //   are split into nibble streams and distributed across toneCount
+  //   channels, so each tone slot carries toneCount × 4 bits.
   const NUM_NIBBLES = 16;
 
   function applyBand(base) {
     bandBase    = base;
+    FREQ_BASE_C = base - 2000;   // Channel C starts 2000 Hz below base
     FREQ_BASE_B = base;          // Channel B starts at bandBase
     FREQ_ACK    = base + 1700;   // ACK marker tone
     FREQ_START  = base + 1800;   // START-of-message marker tone
     FREQ_STOP   = base + 1900;   // STOP / end-of-message marker tone
     FREQ_BASE_A = base + 2000;   // Channel A starts 2000 Hz above base
 
+    const cLo = ((base - 2000) / 1000).toFixed(0);
+    const cHi = ((base - 500) / 1000).toFixed(1);
     const bLo = (base / 1000).toFixed(0);
     const bHi = ((base + 1500) / 1000).toFixed(1);
     const aLo = ((base + 2000) / 1000).toFixed(0);
     const aHi = ((base + 3500) / 1000).toFixed(1);
     const labels = document.getElementById('freqLabels');
     if (labels) {
-      labels.children[0].textContent = 'Ch B: ' + bLo + '–' + bHi;
-      labels.children[2].textContent = 'Ch A: ' + aLo + '–' + aHi;
+      labels.children[0].textContent = 'C: ' + cLo + '–' + cHi;
+      labels.children[1].textContent = 'B: ' + bLo + '–' + bHi + '  Mkr';
+      labels.children[2].textContent = 'A: ' + aLo + '–' + aHi;
     }
   }
 
   applyBand(16000);
 
+  // toneCount: Number of simultaneous data tones per slot (1, 2, or 3).
+  //   Controls the throughput / reliability trade-off:
+  //     1 = Ch A only. Most reliable — only one tone to detect per slot.
+  //         4 bits/slot → ~4.2 B/s at default timing. Best for noisy
+  //         environments, long distances, or weak speakers.
+  //     2 = Ch A + Ch B. Good balance — two tones, 8 bits/slot (1 byte).
+  //         ~8.3 B/s at default timing.
+  //     3 = Ch A + Ch B + Ch C. Fastest — three tones, 12 bits/slot.
+  //         ~12.5 B/s at default timing. Requires all 3 frequency bands
+  //         to be within speaker/mic range (total span: 5500 Hz).
+  //   All communicating devices MUST use the same toneCount.
+  //   Changed at runtime via the "Tones" dropdown in the UI.
+  let toneCount = 3;
+
   // ══════════════════════════════════════════════════════════════════
   // TIMING
+  // These three values control the raw speed of the protocol.
+  // Effective data rate = toneCount × 4 bits / (TONE_MS_NIBBLE + GAP_MS).
+  // Example at defaults (80 + 40 = 120 ms/slot):
+  //   1-tone: 4 bits / 120 ms ≈ 4.2 B/s
+  //   2-tone: 8 bits / 120 ms ≈ 8.3 B/s
+  //   3-tone: 12 bits / 120 ms ≈ 12.5 B/s
   // ══════════════════════════════════════════════════════════════════
 
   // TONE_MS_MARKER (ms): Duration of marker tones (START, STOP, ACK).
-  //   Longer = more reliable detection, shorter = faster protocol overhead.
-  //   Must be > FFT window (FFT_SIZE / SAMPLE_RATE ≈ 46 ms at 2048/44100).
+  //   These are single-frequency tones used for framing, not data.
+  //   Longer = more reliable detection, shorter = less protocol overhead.
+  //   Must be > FFT window (FFT_SIZE / SAMPLE_RATE ≈ 46 ms at 2048/44100)
+  //   and long enough for CONFIRM_FRAMES consecutive FFT hits.
   //   Recommended: 100–200 ms.
   const TONE_MS_MARKER  = 120;
 
-  // TONE_MS_NIBBLE (ms): Duration of each data dual-tone slot.
-  //   One slot = one byte (high nibble on Ch A + low nibble on Ch B).
+  // TONE_MS_NIBBLE (ms): Duration of each data tone slot.
+  //   One slot carries toneCount nibbles simultaneously (1–3 tones).
   //   Must be > FFT window so at least CONFIRM_FRAMES clean FFT frames
-  //   fit inside the tone. At 2048/44100 the window is ~46 ms; at 60 fps
-  //   each frame is ~16 ms. 80 ms gives ~2 clean frames after the first.
+  //   fit inside the tone. At 2048/44100 the FFT window is ~46 ms;
+  //   at 60 fps each frame ≈ 16 ms. 80 ms gives ~2 clean frames
+  //   after the first detection, enough for CONFIRM_FRAMES = 3.
   //   Recommended: 60–120 ms. Lower = faster but less reliable.
   const TONE_MS_NIBBLE  = 80;
 
-  // GAP_MS (ms): Silent gap between consecutive tones.
-  //   Allows the FFT to register silence, resetting the tone confirmation
-  //   counters so the next tone is detected as a fresh event.
+  // GAP_MS (ms): Silent gap between consecutive tone slots.
+  //   Allows the FFT to register silence between slots, resetting the
+  //   tone confirmation counters so the next slot is detected as a
+  //   fresh event. Also prevents spectral smearing between different
+  //   tone values in adjacent slots.
   //   Must be long enough for ≥1 FFT frame of silence (~16 ms at 60 fps).
   //   Recommended: 30–80 ms. Lower = faster but may cause tone bleed.
   const GAP_MS          = 40;
 
   // ══════════════════════════════════════════════════════════════════
   // FFT / DETECTION
+  // The receiver runs an FFT every animation frame and searches for
+  // peaks in each channel band + the marker band. A tone is accepted
+  // only after CONFIRM_FRAMES consecutive frames show the same value.
   // ══════════════════════════════════════════════════════════════════
 
   // FFT_SIZE: Number of samples in each FFT analysis window.
   //   Determines frequency resolution: bin_width = SAMPLE_RATE / FFT_SIZE.
   //   Also determines time window: FFT_SIZE / SAMPLE_RATE seconds.
-  //   2048 → 21.5 Hz bins, 46 ms window (good balance).
+  //   2048 → 21.5 Hz bins, 46 ms window (good balance for 100 Hz steps).
   //   4096 → 10.7 Hz bins, 93 ms window (better resolution but tones
   //          must be ≥93 ms or the FFT smears across tone boundaries).
   //   Must be a power of 2. Recommended: 2048 for 80 ms tones.
+  //   Note: with 3 channels spanning 5500 Hz (bandBase−2000 to
+  //   bandBase+3500), the FFT must resolve all 48 possible data tones
+  //   plus 3 marker tones. 21.5 Hz bins give ~4.6 bins per FREQ_STEP.
   const FFT_SIZE    = 2048;
 
   // SAMPLE_RATE (Hz): Audio sample rate for both playback and recording.
-  //   44100 = CD quality, Nyquist at 22050 Hz.
-  //   48000 = common native rate, Nyquist at 24000 Hz (more high-freq headroom).
+  //   44100 = CD quality, Nyquist at 22050 Hz. Sufficient for all bands
+  //     up to bandBase=17000 (Ch A tops out at 20500 Hz < 22050 Hz).
+  //   48000 = common native rate, Nyquist at 24000 Hz. More headroom
+  //     for high bandBase values or when the browser resamples.
   //   The browser may override this with the device's native rate.
   const SAMPLE_RATE = 44100;
 
@@ -425,26 +512,38 @@
   //   With FREQ_STEP=100 and tolerance=35, adjacent tones have a 30 Hz
   //   dead zone between them (100 − 2×35 = 30), preventing overlap.
   //   Quadratic peak interpolation improves raw bin accuracy to ~2–5 Hz,
-  //   so 35 Hz is generous. Increase if getting false negatives (missed
-  //   tones); decrease if getting false positives (wrong nibble values).
+  //   so 35 Hz is generous. Applied identically to all 3 data channels
+  //   and the marker band.
+  //   Increase if getting false negatives (missed tones).
+  //   Decrease if getting false positives (wrong nibble values).
   //   Must be < FREQ_STEP / 2 to avoid matching the wrong tone.
   const FREQ_TOLERANCE = 35;
 
   // DETECT_THRESHOLD (0–255): Minimum FFT magnitude to consider a peak
   //   as an actual tone vs background noise. The FFT returns byte values
   //   0–255 where 0 = silence and 255 = max amplitude.
+  //   Applied per-channel: each of Ch A, B, C and the marker band is
+  //   searched independently for a peak above this threshold.
   //   Lower = more sensitive (good for weak signals / long distance)
   //   but more prone to noise false positives.
   //   Higher = ignores noise but may miss quiet tones.
+  //   With 3 simultaneous tones the per-tone amplitude is 0.6
+  //   (vs 0.8 for single marker tones), so keep this low enough
+  //   to detect the weaker individual tones.
   //   Recommended: 15–40. Start at 20, lower if tones are not detected.
   const DETECT_THRESHOLD = 20;
 
   // CONFIRM_FRAMES: Number of consecutive FFT frames that must show
-  //   the same detected tone before it is accepted. Prevents transient
-  //   noise spikes from being treated as valid tones.
+  //   the same detected tone(s) before the slot is accepted.
+  //   For markers: the same marker type (START/STOP/ACK) must appear
+  //     in CONFIRM_FRAMES consecutive frames.
+  //   For data: all toneCount channels must show the same nibble values
+  //     for CONFIRM_FRAMES consecutive frames.
+  //   Prevents transient noise spikes from being treated as valid data.
   //   At ~60 fps, each frame ≈ 16 ms; 3 frames ≈ 50 ms.
-  //   Higher = more reliable but slower detection (tone must last longer).
+  //   Higher = more reliable but slower (tone must last longer).
   //   Lower = faster but more false positives.
+  //   Must satisfy: CONFIRM_FRAMES × frame_time < TONE_MS_NIBBLE.
   //   Recommended: 2–4.
   const CONFIRM_FRAMES = 3;
 
@@ -476,17 +575,18 @@
   const RX_IDLE      = 0;
   const RX_RECEIVING = 1;
   let rxState        = RX_IDLE;
-  let rxBytes        = [];
-  let silenceFrames  = 0;
+  let rxNibbles      = [];
+  let lastSignalTime = 0;
 
   // Marker confirmation (ACK / START / STOP)
   let lastMarker     = null;
   let markerConfirm  = 0;
 
-  // Dual-channel data confirmation
-  let lastPairA      = null;
-  let lastPairB      = null;
-  let pairConfirm    = 0;
+  // Tri-channel data confirmation
+  let lastTriA       = null;
+  let lastTriB       = null;
+  let lastTriC       = null;
+  let triConfirm     = 0;
 
   // Speed measurement state
   let rxStartTime    = 0;
@@ -555,6 +655,10 @@
     return FREQ_BASE_B + n * FREQ_STEP;
   }
 
+  function nibbleToFreqC(n) {
+    return FREQ_BASE_C + n * FREQ_STEP;
+  }
+
   function freqToBin(freq, fftSize, sampleRate) {
     return Math.round(freq / (sampleRate / fftSize));
   }
@@ -617,26 +721,68 @@
       const ctx = ensureAudioCtx();
       const oscA = ctx.createOscillator();
       const oscB = ctx.createOscillator();
-      const gain = ctx.createGain();
+      const gainA = ctx.createGain();
+      const gainB = ctx.createGain();
 
       oscA.type = 'sine';
       oscA.frequency.setValueAtTime(freqA, ctx.currentTime);
       oscB.type = 'sine';
       oscB.frequency.setValueAtTime(freqB, ctx.currentTime);
 
-      gain.gain.setValueAtTime(0, ctx.currentTime);
-      gain.gain.linearRampToValueAtTime(0.5, ctx.currentTime + 0.005);
-      gain.gain.setValueAtTime(0.5, ctx.currentTime + durationMs / 1000 - 0.005);
-      gain.gain.linearRampToValueAtTime(0, ctx.currentTime + durationMs / 1000);
+      const dur = durationMs / 1000;
+      [gainA, gainB].forEach(g => {
+        g.gain.setValueAtTime(0, ctx.currentTime);
+        g.gain.linearRampToValueAtTime(0.7, ctx.currentTime + 0.005);
+        g.gain.setValueAtTime(0.7, ctx.currentTime + dur - 0.005);
+        g.gain.linearRampToValueAtTime(0, ctx.currentTime + dur);
+      });
 
-      oscA.connect(gain);
-      oscB.connect(gain);
-      gain.connect(ctx.destination);
+      oscA.connect(gainA); gainA.connect(ctx.destination);
+      oscB.connect(gainB); gainB.connect(ctx.destination);
 
       oscA.start(ctx.currentTime);
       oscB.start(ctx.currentTime);
-      oscA.stop(ctx.currentTime + durationMs / 1000 + 0.01);
-      oscB.stop(ctx.currentTime + durationMs / 1000 + 0.01);
+      oscA.stop(ctx.currentTime + dur + 0.01);
+      oscB.stop(ctx.currentTime + dur + 0.01);
+
+      setTimeout(resolve, durationMs);
+    });
+  }
+
+  function playTriTone(freqA, freqB, freqC, durationMs) {
+    return new Promise(resolve => {
+      const ctx = ensureAudioCtx();
+      const oscA = ctx.createOscillator();
+      const oscB = ctx.createOscillator();
+      const oscC = ctx.createOscillator();
+      const gainA = ctx.createGain();
+      const gainB = ctx.createGain();
+      const gainC = ctx.createGain();
+
+      oscA.type = 'sine';
+      oscA.frequency.setValueAtTime(freqA, ctx.currentTime);
+      oscB.type = 'sine';
+      oscB.frequency.setValueAtTime(freqB, ctx.currentTime);
+      oscC.type = 'sine';
+      oscC.frequency.setValueAtTime(freqC, ctx.currentTime);
+
+      const dur = durationMs / 1000;
+      const amp = 0.6; // per-tone amplitude (3 tones, keep total reasonable)
+      [gainA, gainB, gainC].forEach(g => {
+        g.gain.setValueAtTime(0, ctx.currentTime);
+        g.gain.linearRampToValueAtTime(amp, ctx.currentTime + 0.005);
+        g.gain.setValueAtTime(amp, ctx.currentTime + dur - 0.005);
+        g.gain.linearRampToValueAtTime(0, ctx.currentTime + dur);
+      });
+
+      oscA.connect(gainA); gainA.connect(ctx.destination);
+      oscB.connect(gainB); gainB.connect(ctx.destination);
+      oscC.connect(gainC); gainC.connect(ctx.destination);
+
+      [oscA, oscB, oscC].forEach(o => {
+        o.start(ctx.currentTime);
+        o.stop(ctx.currentTime + dur + 0.01);
+      });
 
       setTimeout(resolve, durationMs);
     });
@@ -644,6 +790,81 @@
 
   function silence(durationMs) {
     return new Promise(resolve => setTimeout(resolve, durationMs));
+  }
+
+  // ── Shared nibble-stream transmitter ──
+  // Converts bytes to nibbles, appends CRC, sends in groups of toneCount.
+  async function transmitBytes(bytes) {
+    const tc = toneCount;
+    const hash = crc8(bytes);
+    log('TX: CRC-8 = 0x' + hash.toString(16).toUpperCase().padStart(2, '0') +
+        ' (' + (bytes.length + 1) + ' bytes, ' + tc + '-tone mode)');
+
+    // Convert bytes + CRC to nibble stream
+    const allBytes = new Uint8Array(bytes.length + 1);
+    allBytes.set(bytes);
+    allBytes[bytes.length] = hash;
+
+    const nibbles = [];
+    for (let i = 0; i < allBytes.length; i++) {
+      nibbles.push((allBytes[i] >> 4) & 0x0F);
+      nibbles.push(allBytes[i] & 0x0F);
+    }
+    // Pad to multiple of toneCount
+    while (nibbles.length % tc !== 0) nibbles.push(0);
+
+    // START marker
+    await playTone(FREQ_START, TONE_MS_MARKER);
+    await silence(GAP_MS);
+
+    // Send nibbles in groups of toneCount
+    for (let i = 0; i < nibbles.length; i += tc) {
+      if (tc === 1) {
+        await playTone(nibbleToFreqA(nibbles[i]), TONE_MS_NIBBLE);
+      } else if (tc === 2) {
+        await playDualTone(
+          nibbleToFreqA(nibbles[i]),
+          nibbleToFreqB(nibbles[i + 1]),
+          TONE_MS_NIBBLE
+        );
+      } else {
+        await playTriTone(
+          nibbleToFreqA(nibbles[i]),
+          nibbleToFreqB(nibbles[i + 1]),
+          nibbleToFreqC(nibbles[i + 2]),
+          TONE_MS_NIBBLE
+        );
+      }
+      await silence(GAP_MS);
+    }
+
+    // STOP marker
+    await playTone(FREQ_STOP, TONE_MS_MARKER);
+
+    return bytes.length;
+  }
+
+  function waitForAck(msgEl) {
+    if (!isListening) return;
+    waitingForAck = true;
+    ackCount = 0;
+    lastSentMsgEl = msgEl;
+    msgEl.querySelector('.meta').textContent += ' — awaiting ACK...';
+    setStatus('Waiting for ACK...', 'sending');
+    log('TX: Waiting for ACKs...');
+    ackTimeout = setTimeout(() => {
+      waitingForAck = false;
+      if (lastSentMsgEl) {
+        const meta = lastSentMsgEl.querySelector('.meta');
+        if (ackCount === 0) {
+          meta.textContent = meta.textContent.replace(/ — awaiting ACK\.\.\.$/, '') + ' — NO ACK';
+          meta.classList.add('no-ack');
+        }
+        lastSentMsgEl = null;
+      }
+      log('TX: ACK window closed — ' + ackCount + ' receiver(s) confirmed');
+      setStatus(isListening ? 'Listening' : 'Idle', isListening ? 'listening' : '');
+    }, 5000);
   }
 
   async function transmitMessage(text) {
@@ -655,68 +876,22 @@
 
     try {
       const txStart = performance.now();
-
-      // START marker
-      await playTone(FREQ_START, TONE_MS_MARKER);
-      await silence(GAP_MS);
-
-      // Encode each character
       const encoder = new TextEncoder();
-      const bytes = encoder.encode(text);
+      const textBytes = encoder.encode(text);
+      const bytes = new Uint8Array(1 + textBytes.length);
+      bytes[0] = 0x00;
+      bytes.set(textBytes, 1);
 
-      // Send each data byte as dual tone
-      for (let i = 0; i < bytes.length; i++) {
-        const byte = bytes[i];
-        await playDualTone(
-          nibbleToFreqA((byte >> 4) & 0x0F),
-          nibbleToFreqB(byte & 0x0F),
-          TONE_MS_NIBBLE
-        );
-        await silence(GAP_MS);
-      }
-
-      // Send CRC-8 hash as final byte
-      const hash = crc8(bytes);
-      await playDualTone(
-        nibbleToFreqA((hash >> 4) & 0x0F),
-        nibbleToFreqB(hash & 0x0F),
-        TONE_MS_NIBBLE
-      );
-      await silence(GAP_MS);
-      log('TX: Sent CRC-8 = 0x' + hash.toString(16).toUpperCase().padStart(2, '0'));
-
-      // STOP marker
-      await playTone(FREQ_STOP, TONE_MS_MARKER);
+      const byteCount = await transmitBytes(bytes);
 
       const txElapsed = performance.now() - txStart;
-      const speed = formatSpeed(bytes.length, txElapsed);
+      const speed = formatSpeed(byteCount, txElapsed);
       txSpeedEl.textContent = speed.display;
       txDetailEl.textContent = speed.detail;
 
-      lastSentMsgEl = addMessage(text, 'sent');
+      const msgEl = addMessage(text, 'sent');
       log('TX complete — ' + speed.detail);
-
-      // Wait for ACKs if listening — collect for full timeout window
-      if (isListening) {
-        waitingForAck = true;
-        ackCount = 0;
-        lastSentMsgEl.querySelector('.meta').textContent += ' — awaiting ACK...';
-        setStatus('Waiting for ACK...', 'sending');
-        log('TX: Waiting for ACKs...');
-        ackTimeout = setTimeout(() => {
-          waitingForAck = false;
-          if (lastSentMsgEl) {
-            const meta = lastSentMsgEl.querySelector('.meta');
-            if (ackCount === 0) {
-              meta.textContent = meta.textContent.replace(/ — awaiting ACK\.\.\.$/, '') + ' — NO ACK';
-              meta.classList.add('no-ack');
-            }
-            lastSentMsgEl = null;
-          }
-          log('TX: ACK window closed — ' + ackCount + ' receiver(s) confirmed');
-          setStatus(isListening ? 'Listening' : 'Idle', isListening ? 'listening' : '');
-        }, 5000);
-      }
+      waitForAck(msgEl);
     } catch (e) {
       log('TX error: ' + e.message);
     }
@@ -726,6 +901,86 @@
     if (!waitingForAck) {
       setStatus(isListening ? 'Listening' : 'Idle', isListening ? 'listening' : '');
     }
+  }
+
+  // ── File Transmission ──
+  const MAX_FILE_SIZE = 1024;
+
+  async function transmitFile(file) {
+    if (isSending) return;
+
+    if (file.size > MAX_FILE_SIZE) {
+      log('TX: File too large (' + file.size + ' bytes, max ' + MAX_FILE_SIZE + ')');
+      alert('File too large. Maximum size is ' + MAX_FILE_SIZE + ' bytes.');
+      return;
+    }
+
+    isSending = true;
+    btnSend.disabled = true;
+    document.getElementById('btnFile').disabled = true;
+    setStatus('Sending file...', 'sending');
+    log('TX: file "' + file.name + '" (' + file.size + ' bytes)');
+
+    try {
+      const txStart = performance.now();
+      const fileData = new Uint8Array(await file.arrayBuffer());
+      const encoder = new TextEncoder();
+      const nameBytes = encoder.encode(file.name);
+      const nameLen = Math.min(nameBytes.length, 255);
+
+      const bytes = new Uint8Array(1 + 1 + nameLen + fileData.length);
+      bytes[0] = 0x01;
+      bytes[1] = nameLen;
+      bytes.set(nameBytes.subarray(0, nameLen), 2);
+      bytes.set(fileData, 2 + nameLen);
+
+      const byteCount = await transmitBytes(bytes);
+
+      const txElapsed = performance.now() - txStart;
+      const speed = formatSpeed(byteCount, txElapsed);
+      txSpeedEl.textContent = speed.display;
+      txDetailEl.textContent = speed.detail;
+
+      const msgEl = addMessage('File: ' + file.name + ' (' + file.size + ' B)', 'sent');
+      log('TX file complete — ' + speed.detail);
+      waitForAck(msgEl);
+    } catch (e) {
+      log('TX file error: ' + e.message);
+    }
+
+    isSending = false;
+    document.getElementById('btnFile').disabled = false;
+    btnSend.disabled = false;
+    if (!waitingForAck) {
+      setStatus(isListening ? 'Listening' : 'Idle', isListening ? 'listening' : '');
+    }
+  }
+
+  function addFileMessage(fileName, fileData, type, crcOk) {
+    const div = document.createElement('div');
+    div.className = 'msg ' + type;
+    const body = document.createElement('div');
+    body.textContent = 'File: ' + fileName + ' (' + fileData.length + ' B)';
+    div.appendChild(body);
+    if (type === 'received') {
+      const blob = new Blob([fileData]);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.className = 'file-link';
+      link.href = url;
+      link.download = fileName;
+      link.textContent = 'Download ' + fileName;
+      div.appendChild(link);
+    }
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    if (crcOk === false) meta.classList.add('no-ack');
+    meta.textContent = (type === 'sent' ? 'Sent' : 'Received') + ' at ' +
+      new Date().toLocaleTimeString() + (crcOk === false ? ' — CRC FAIL' : '');
+    div.appendChild(meta);
+    messagesEl.appendChild(div);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+    return div;
   }
 
   // ── Microphone & Reception ──
@@ -750,13 +1005,14 @@
 
       isListening = true;
       rxState = RX_IDLE;
-      rxBytes = [];
+      rxNibbles = [];
       lastMarker = null;
       markerConfirm = 0;
-      lastPairA = null;
-      lastPairB = null;
-      pairConfirm = 0;
-      silenceFrames = 0;
+      lastTriA = null;
+      lastTriB = null;
+      lastTriC = null;
+      triConfirm = 0;
+      lastSignalTime = performance.now();
 
       btnListen.disabled = true;
       btnStop.disabled = false;
@@ -785,7 +1041,7 @@
     }
     analyser = null;
     rxState = RX_IDLE;
-    rxBytes = [];
+    rxNibbles = [];
 
     btnListen.disabled = false;
     btnStop.disabled = true;
@@ -823,7 +1079,7 @@
   }
 
   function detectTones(data, bufLen, sampleRate) {
-    let marker = null, chA = null, chB = null;
+    let marker = null, chA = null, chB = null, chC = null;
 
     // Marker band (bandBase+1650 – bandBase+1950)
     const mFreq = findPeak(data, bufLen, bandBase + 1650, bandBase + 1950, sampleRate);
@@ -833,7 +1089,7 @@
       else if (Math.abs(mFreq - FREQ_STOP)  < FREQ_TOLERANCE) marker = 'STOP';
     }
 
-    // Channel A – high nibble (bandBase+2000 – bandBase+3500)
+    // Channel A (bandBase+2000 – bandBase+3500)
     const aFreq = findPeak(data, bufLen, bandBase + 1950, bandBase + 3550, sampleRate);
     if (aFreq !== null) {
       for (let n = 0; n < NUM_NIBBLES; n++) {
@@ -841,7 +1097,7 @@
       }
     }
 
-    // Channel B – low nibble (bandBase – bandBase+1500)
+    // Channel B (bandBase – bandBase+1500)
     const bFreq = findPeak(data, bufLen, bandBase - 50, bandBase + 1550, sampleRate);
     if (bFreq !== null) {
       for (let n = 0; n < NUM_NIBBLES; n++) {
@@ -849,24 +1105,40 @@
       }
     }
 
-    return { marker, chA, chB };
+    // Channel C (bandBase-2000 – bandBase-500)
+    const cFreq = findPeak(data, bufLen, bandBase - 2050, bandBase - 450, sampleRate);
+    if (cFreq !== null) {
+      for (let n = 0; n < NUM_NIBBLES; n++) {
+        if (Math.abs(cFreq - nibbleToFreqC(n)) < FREQ_TOLERANCE) { chC = n; break; }
+      }
+    }
+
+    return { marker, chA, chB, chC };
   }
 
-  function processTones({ marker, chA, chB }) {
-    const anySignal = (marker !== null || chA !== null || chB !== null);
+  function processTones({ marker, chA, chB, chC }) {
+    // Real markers are single tones; during data slots the active channels
+    // are present. If the expected data channels are active, suppress false markers.
+    const dataPresent = (toneCount === 1 && chA !== null) ||
+                        (toneCount >= 2 && chA !== null && chB !== null);
+    if (marker !== null && dataPresent) {
+      marker = null;
+    }
+
+    const anySignal = (marker !== null || chA !== null || chB !== null || chC !== null);
 
     if (!anySignal) {
-      silenceFrames++;
       markerConfirm = 0; lastMarker = null;
-      pairConfirm = 0; lastPairA = null; lastPairB = null;
+      triConfirm = 0; lastTriA = null; lastTriB = null; lastTriC = null;
 
-      if (rxState === RX_RECEIVING && silenceFrames > 120) {
+      // Time-based silence timeout (2 seconds)
+      if (rxState === RX_RECEIVING && (performance.now() - lastSignalTime) > 2000) {
         flushReceived();
       }
       return;
     }
 
-    silenceFrames = 0;
+    lastSignalTime = performance.now();
 
     // ── Marker confirmation ──
     if (marker !== null) {
@@ -878,7 +1150,6 @@
       }
 
       if (markerConfirm === CONFIRM_FRAMES) {
-        // ACK is always processed (even while sending)
         if (marker === 'ACK') {
           if (waitingForAck) {
             ackCount++;
@@ -893,7 +1164,7 @@
         } else if (!isSending) {
           if (marker === 'START' && rxState === RX_IDLE) {
             rxState = RX_RECEIVING;
-            rxBytes = [];
+            rxNibbles = [];
             rxStartTime = performance.now();
             log('RX: START detected');
             setStatus('Receiving...', 'sending');
@@ -902,36 +1173,49 @@
           }
         }
         markerConfirm = CONFIRM_FRAMES + 100;
+        return;
       }
-      return; // markers take priority; skip data processing this frame
+    } else {
+      markerConfirm = 0;
+      lastMarker = null;
     }
 
-    // ── Dual-channel data confirmation ──
-    if (isSending) return; // prevent self-reception
+    // ── Multi-channel data confirmation ──
+    if (isSending) return;
 
-    if (chA !== null && chB !== null) {
-      if (chA === lastPairA && chB === lastPairB) {
-        pairConfirm++;
+    const tc = toneCount;
+    const slotOk = (tc === 1 && chA !== null) ||
+                   (tc === 2 && chA !== null && chB !== null) ||
+                   (tc === 3 && chA !== null && chB !== null && chC !== null);
+
+    if (slotOk) {
+      const curA = chA, curB = (tc >= 2 ? chB : 0), curC = (tc >= 3 ? chC : 0);
+      if (curA === lastTriA && curB === lastTriB && curC === lastTriC) {
+        triConfirm++;
       } else {
-        lastPairA = chA;
-        lastPairB = chB;
-        pairConfirm = 1;
+        lastTriA = curA;
+        lastTriB = curB;
+        lastTriC = curC;
+        triConfirm = 1;
         return;
       }
 
-      if (pairConfirm === CONFIRM_FRAMES) {
+      if (triConfirm === CONFIRM_FRAMES) {
         if (rxState === RX_RECEIVING) {
-          const byte = (chA << 4) | chB;
-          rxBytes.push(byte);
-          log('RX byte: 0x' + byte.toString(16).toUpperCase().padStart(2, '0'));
+          rxNibbles.push(curA);
+          if (tc >= 2) rxNibbles.push(curB);
+          if (tc >= 3) rxNibbles.push(curC);
+          log('RX slot: ' + curA.toString(16) +
+              (tc >= 2 ? ' ' + curB.toString(16) : '') +
+              (tc >= 3 ? ' ' + curC.toString(16) : ''));
         }
-        pairConfirm = CONFIRM_FRAMES + 100;
+        triConfirm = CONFIRM_FRAMES + 100;
       }
     } else {
-      // partial channel data — reset pair confirmation
-      pairConfirm = 0;
-      lastPairA = null;
-      lastPairB = null;
+      triConfirm = 0;
+      lastTriA = null;
+      lastTriB = null;
+      lastTriC = null;
     }
   }
 
@@ -939,10 +1223,19 @@
     rxState = RX_IDLE;
     setStatus(isListening ? 'Listening' : 'Idle', isListening ? 'listening' : '');
 
-    // Need at least 1 data byte + 1 hash byte
+    log('RX: flush — ' + rxNibbles.length + ' nibbles received');
+
+    // Reassemble nibbles into bytes (every 2 nibbles = 1 byte)
+    // Discard any trailing odd nibble (padding)
+    const rxBytes = [];
+    for (let i = 0; i + 1 < rxNibbles.length; i += 2) {
+      rxBytes.push((rxNibbles[i] << 4) | rxNibbles[i + 1]);
+    }
+
+    // Need at least 1 data byte + 1 CRC byte
     if (rxBytes.length < 2) {
       log('RX: too few bytes (' + rxBytes.length + '), discarding');
-      rxBytes = [];
+      rxNibbles = [];
       return;
     }
 
@@ -960,22 +1253,52 @@
     }
 
     const rxElapsed = performance.now() - rxStartTime;
+    const speed = formatSpeed(dataBytes.length, rxElapsed);
+    rxSpeedEl.textContent = speed.display;
+    rxDetailEl.textContent = speed.detail;
+
+    const typeByte = dataBytes[0];
+    log('RX: type=0x' + typeByte.toString(16).toUpperCase().padStart(2, '0') +
+        ' dataLen=' + dataBytes.length + ' crc=' + (hashMatch ? 'OK' : 'FAIL'));
 
     try {
-      const decoder = new TextDecoder('utf-8', { fatal: false });
-      const text = decoder.decode(new Uint8Array(dataBytes));
-      if (text.length > 0) {
-        const speed = formatSpeed(dataBytes.length, rxElapsed);
-        rxSpeedEl.textContent = speed.display;
-        rxDetailEl.textContent = speed.detail;
-        addMessage(text + (hashMatch ? '' : ' [CRC FAIL]'), 'received');
-        log('RX: "' + text + '" — ' + speed.detail);
+      if (typeByte === 0x01 && dataBytes.length >= 3) {
+        const nameLen = dataBytes[1];
+        log('RX: file branch — nameLen=' + nameLen + ' available=' + (dataBytes.length - 2));
+        if (dataBytes.length < 2 + nameLen) {
+          log('RX: file header truncated, showing as raw data');
+          const rawData = new Uint8Array(dataBytes.slice(1));
+          addFileMessage('corrupted_file.bin', rawData, 'received', false);
+        } else {
+          const decoder = new TextDecoder('utf-8', { fatal: false });
+          const fileName = decoder.decode(new Uint8Array(dataBytes.slice(2, 2 + nameLen)));
+          const fileData = new Uint8Array(dataBytes.slice(2 + nameLen));
+          addFileMessage(fileName, fileData, 'received', hashMatch);
+          log('RX: file "' + fileName + '" (' + fileData.length + ' B) — ' + speed.detail);
+        }
+      } else if (typeByte === 0x00 && dataBytes.length >= 2) {
+        log('RX: text branch');
+        const decoder = new TextDecoder('utf-8', { fatal: false });
+        const text = decoder.decode(new Uint8Array(dataBytes.slice(1)));
+        if (text.length > 0) {
+          addMessage(text + (hashMatch ? '' : ' [CRC FAIL]'), 'received');
+          log('RX: "' + text + '" — ' + speed.detail);
+        }
+      } else {
+        log('RX: legacy branch');
+        const decoder = new TextDecoder('utf-8', { fatal: false });
+        const text = decoder.decode(new Uint8Array(dataBytes));
+        if (text.length > 0) {
+          addMessage(text + (hashMatch ? '' : ' [CRC FAIL]'), 'received');
+          log('RX: (legacy) "' + text + '" — ' + speed.detail);
+        }
       }
     } catch (e) {
       log('RX decode error: ' + e.message);
+      addMessage('[Decode error: ' + e.message + ']', 'received');
     }
 
-    rxBytes = [];
+    rxNibbles = [];
 
     if (hashMatch) {
       sendAck();
@@ -1008,25 +1331,32 @@
     ctx.fillStyle = '#0d1117';
     ctx.fillRect(0, 0, w, h);
 
-    // Draw full band (bandBase-100 to bandBase+3600)
-    const binLow  = freqToBin(bandBase - 100, FFT_SIZE, sampleRate);
+    // Draw full band (bandBase-2100 to bandBase+3600)
+    const binLow  = freqToBin(bandBase - 2100, FFT_SIZE, sampleRate);
     const binHigh = freqToBin(bandBase + 3600, FFT_SIZE, sampleRate);
     const numBins = binHigh - binLow + 1;
     const barW = w / numBins;
 
+    const chCTop   = bandBase - 450;
     const chBTop   = bandBase + 1550;
     const markerTop = bandBase + 2000;
 
     for (let i = 0; i < numBins; i++) {
       const bin = binLow + i;
+      if (bin < 0 || bin >= bufLen) continue;
       const val = data[bin] / 255;
       const barH = val * h;
 
       const freq = binToFreq(bin, FFT_SIZE, sampleRate);
       let color;
-      if (freq < chBTop) {
-        // Channel B (orange)
-        color = `hsla(30, 90%, ${30 + val * 40}%, ${0.4 + val * 0.6})`;
+      if (freq < chCTop) {
+        // Channel C (purple)
+        color = `hsla(280, 80%, ${30 + val * 40}%, ${0.4 + val * 0.6})`;
+      } else if (freq < chBTop) {
+        // Channel B (orange) + gap between C and B
+        color = (freq >= bandBase - 50) ?
+          `hsla(30, 90%, ${30 + val * 40}%, ${0.4 + val * 0.6})` :
+          `rgba(50, 50, 80, ${0.2 + val * 0.3})`;
       } else if (freq < markerTop) {
         // Markers (blue)
         color = `rgba(0, 150, 255, ${0.3 + val * 0.7})`;
@@ -1040,13 +1370,17 @@
     }
 
     // Overlay: detected tone labels
-    if (silenceFrames < 3) {
+    if ((performance.now() - lastSignalTime) < 100) {
       ctx.fillStyle = 'rgba(255,255,255,0.85)';
       ctx.font = '11px monospace';
       const labels = [];
       if (lastMarker !== null && markerConfirm >= 1) labels.push(lastMarker);
-      if (lastPairA !== null && lastPairB !== null && pairConfirm >= 1)
-        labels.push('0x' + ((lastPairA << 4) | lastPairB).toString(16).toUpperCase().padStart(2, '0'));
+      if (lastTriA !== null && triConfirm >= 1) {
+        let s = lastTriA.toString(16);
+        if (toneCount >= 2 && lastTriB !== null) s += '.' + lastTriB.toString(16);
+        if (toneCount >= 3 && lastTriC !== null) s += '.' + lastTriC.toString(16);
+        labels.push(s);
+      }
       if (labels.length) ctx.fillText(labels.join(' | '), 6, 14);
     }
   }
@@ -1059,6 +1393,12 @@
     log('Band changed to ' + (base / 1000) + '–' + ((base + 3500) / 1000) + ' kHz');
   });
 
+  const toneSelect = document.getElementById('toneSelect');
+  toneSelect.addEventListener('change', () => {
+    toneCount = parseInt(toneSelect.value, 10);
+    log('Tone count changed to ' + toneCount);
+  });
+
   btnSend.addEventListener('click', () => {
     const text = msgInput.value.trim();
     if (!text) return;
@@ -1068,6 +1408,18 @@
 
   msgInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') btnSend.click();
+  });
+
+  const btnFile   = document.getElementById('btnFile');
+  const fileInput = document.getElementById('fileInput');
+
+  btnFile.addEventListener('click', () => fileInput.click());
+  fileInput.addEventListener('change', () => {
+    const file = fileInput.files[0];
+    if (file) {
+      transmitFile(file);
+      fileInput.value = '';
+    }
   });
 
   btnListen.addEventListener('click', startListening);
