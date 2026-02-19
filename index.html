@@ -200,6 +200,31 @@
     border: 1px solid #1e293b;
   }
 
+  .freq-select {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    font-size: 0.8em;
+  }
+
+  .freq-select select {
+    padding: 4px 8px;
+    border-radius: 6px;
+    border: 1px solid #1e293b;
+    background: #111827;
+    color: #e0e0e0;
+    font-size: 0.95em;
+    outline: none;
+  }
+
+  .freq-select select:focus { border-color: #00d4ff; }
+
+  .freq-select .freq-warn {
+    color: #ff8800;
+    font-size: 0.85em;
+  }
+
   .speed-panel {
     background: #111827;
     border: 1px solid #1e293b;
@@ -249,9 +274,20 @@
     </div>
   </header>
 
+  <div class="freq-select">
+    <label for="bandSelect">Band:</label>
+    <select id="bandSelect">
+      <option value="12000">12–15.5 kHz (Reliable)</option>
+      <option value="14000">14–17.5 kHz (Balanced)</option>
+      <option value="16000" selected>16–19.5 kHz (Inaudible)</option>
+      <option value="17000">17–20.5 kHz (Ultra-high)</option>
+    </select>
+    <span class="freq-warn">All devices must match!</span>
+  </div>
+
   <div class="visualizer-wrapper">
     <canvas id="spectrum"></canvas>
-    <div class="freq-labels">
+    <div class="freq-labels" id="freqLabels">
       <span>Ch B: 16–17.5</span>
       <span>Markers</span>
       <span>Ch A: 18–19.5</span>
@@ -290,27 +326,127 @@
 (function() {
   'use strict';
 
-  // ── Frequency Map ──
-  const FREQ_BASE_B = 16000; // Channel B (low nibble): 16000–17500 Hz
-  const FREQ_ACK   = 17700;
-  const FREQ_START = 17800;
-  const FREQ_STOP  = 17900;
-  const FREQ_BASE_A = 18000; // Channel A (high nibble): 18000–19500 Hz
+  // ══════════════════════════════════════════════════════════════════
+  // FREQUENCY MAP
+  // All frequencies are derived from a single bandBase value (Hz).
+  // Layout across the spectrum:
+  //   Ch B [base .. base+1500]  |  gap  |  ACK [+1700]  START [+1800]  STOP [+1900]  |  Ch A [+2000 .. +3500]
+  //
+  // bandBase (Hz): Starting frequency of Channel B. Controls where the
+  //   entire protocol sits in the spectrum. Lower = more reliable but
+  //   more audible. Higher = less audible but hardware may roll off.
+  //   Typical values: 12000 (reliable), 14000 (balanced), 16000 (inaudible).
+  //   All communicating devices MUST use the same bandBase.
+  // ══════════════════════════════════════════════════════════════════
+  let bandBase   = 16000;
+  let FREQ_BASE_B, FREQ_ACK, FREQ_START, FREQ_STOP, FREQ_BASE_A;
+
+  // FREQ_STEP (Hz): Spacing between adjacent tone frequencies within a
+  //   channel. Each nibble (0–15) maps to base + nibble * FREQ_STEP.
+  //   Must be large enough for the FFT to resolve (> 2× bin width).
+  //   At FFT 2048 / 44100 Hz, bin width is ~21.5 Hz, so 100 Hz gives
+  //   comfortable separation. Smaller = more tones in less bandwidth
+  //   but higher risk of misdetection.
   const FREQ_STEP   = 100;
+
+  // NUM_NIBBLES: Number of distinct tone frequencies per channel.
+  //   16 = 4 bits per nibble. Two channels transmit high + low nibble
+  //   of each byte simultaneously. Changing this requires matching
+  //   FREQ_STEP and channel bandwidth (NUM_NIBBLES × FREQ_STEP ≤ 1600 Hz).
   const NUM_NIBBLES = 16;
 
-  const TONE_MS_MARKER  = 150;
-  const TONE_MS_NIBBLE  = 100;
-  const GAP_MS          = 60;
+  function applyBand(base) {
+    bandBase    = base;
+    FREQ_BASE_B = base;          // Channel B starts at bandBase
+    FREQ_ACK    = base + 1700;   // ACK marker tone
+    FREQ_START  = base + 1800;   // START-of-message marker tone
+    FREQ_STOP   = base + 1900;   // STOP / end-of-message marker tone
+    FREQ_BASE_A = base + 2000;   // Channel A starts 2000 Hz above base
 
+    const bLo = (base / 1000).toFixed(0);
+    const bHi = ((base + 1500) / 1000).toFixed(1);
+    const aLo = ((base + 2000) / 1000).toFixed(0);
+    const aHi = ((base + 3500) / 1000).toFixed(1);
+    const labels = document.getElementById('freqLabels');
+    if (labels) {
+      labels.children[0].textContent = 'Ch B: ' + bLo + '–' + bHi;
+      labels.children[2].textContent = 'Ch A: ' + aLo + '–' + aHi;
+    }
+  }
+
+  applyBand(16000);
+
+  // ══════════════════════════════════════════════════════════════════
+  // TIMING
+  // ══════════════════════════════════════════════════════════════════
+
+  // TONE_MS_MARKER (ms): Duration of marker tones (START, STOP, ACK).
+  //   Longer = more reliable detection, shorter = faster protocol overhead.
+  //   Must be > FFT window (FFT_SIZE / SAMPLE_RATE ≈ 46 ms at 2048/44100).
+  //   Recommended: 100–200 ms.
+  const TONE_MS_MARKER  = 120;
+
+  // TONE_MS_NIBBLE (ms): Duration of each data dual-tone slot.
+  //   One slot = one byte (high nibble on Ch A + low nibble on Ch B).
+  //   Must be > FFT window so at least CONFIRM_FRAMES clean FFT frames
+  //   fit inside the tone. At 2048/44100 the window is ~46 ms; at 60 fps
+  //   each frame is ~16 ms. 80 ms gives ~2 clean frames after the first.
+  //   Recommended: 60–120 ms. Lower = faster but less reliable.
+  const TONE_MS_NIBBLE  = 80;
+
+  // GAP_MS (ms): Silent gap between consecutive tones.
+  //   Allows the FFT to register silence, resetting the tone confirmation
+  //   counters so the next tone is detected as a fresh event.
+  //   Must be long enough for ≥1 FFT frame of silence (~16 ms at 60 fps).
+  //   Recommended: 30–80 ms. Lower = faster but may cause tone bleed.
+  const GAP_MS          = 40;
+
+  // ══════════════════════════════════════════════════════════════════
+  // FFT / DETECTION
+  // ══════════════════════════════════════════════════════════════════
+
+  // FFT_SIZE: Number of samples in each FFT analysis window.
+  //   Determines frequency resolution: bin_width = SAMPLE_RATE / FFT_SIZE.
+  //   Also determines time window: FFT_SIZE / SAMPLE_RATE seconds.
+  //   2048 → 21.5 Hz bins, 46 ms window (good balance).
+  //   4096 → 10.7 Hz bins, 93 ms window (better resolution but tones
+  //          must be ≥93 ms or the FFT smears across tone boundaries).
+  //   Must be a power of 2. Recommended: 2048 for 80 ms tones.
   const FFT_SIZE    = 2048;
+
+  // SAMPLE_RATE (Hz): Audio sample rate for both playback and recording.
+  //   44100 = CD quality, Nyquist at 22050 Hz.
+  //   48000 = common native rate, Nyquist at 24000 Hz (more high-freq headroom).
+  //   The browser may override this with the device's native rate.
   const SAMPLE_RATE = 44100;
 
-  // Frequency tolerance for detection (Hz)
-  const FREQ_TOLERANCE = 40;
+  // FREQ_TOLERANCE (Hz): Maximum allowed deviation between a detected
+  //   FFT peak and a known tone frequency to count as a match.
+  //   With FREQ_STEP=100 and tolerance=35, adjacent tones have a 30 Hz
+  //   dead zone between them (100 − 2×35 = 30), preventing overlap.
+  //   Quadratic peak interpolation improves raw bin accuracy to ~2–5 Hz,
+  //   so 35 Hz is generous. Increase if getting false negatives (missed
+  //   tones); decrease if getting false positives (wrong nibble values).
+  //   Must be < FREQ_STEP / 2 to avoid matching the wrong tone.
+  const FREQ_TOLERANCE = 35;
 
-  // Minimum magnitude to consider a tone present
+  // DETECT_THRESHOLD (0–255): Minimum FFT magnitude to consider a peak
+  //   as an actual tone vs background noise. The FFT returns byte values
+  //   0–255 where 0 = silence and 255 = max amplitude.
+  //   Lower = more sensitive (good for weak signals / long distance)
+  //   but more prone to noise false positives.
+  //   Higher = ignores noise but may miss quiet tones.
+  //   Recommended: 15–40. Start at 20, lower if tones are not detected.
   const DETECT_THRESHOLD = 20;
+
+  // CONFIRM_FRAMES: Number of consecutive FFT frames that must show
+  //   the same detected tone before it is accepted. Prevents transient
+  //   noise spikes from being treated as valid tones.
+  //   At ~60 fps, each frame ≈ 16 ms; 3 frames ≈ 50 ms.
+  //   Higher = more reliable but slower detection (tone must last longer).
+  //   Lower = faster but more false positives.
+  //   Recommended: 2–4.
+  const CONFIRM_FRAMES = 3;
 
   // ── DOM Elements ──
   const statusDot  = document.getElementById('statusDot');
@@ -341,7 +477,6 @@
   const RX_RECEIVING = 1;
   let rxState        = RX_IDLE;
   let rxBytes        = [];
-  const CONFIRM_FRAMES = 3;
   let silenceFrames  = 0;
 
   // Marker confirmation (ACK / START / STOP)
@@ -360,6 +495,7 @@
   let waitingForAck  = false;
   let ackTimeout     = null;
   let lastSentMsgEl  = null;
+  let ackCount       = 0;
 
   // ── Helpers ──
   function log(msg) {
@@ -425,6 +561,18 @@
 
   function binToFreq(bin, fftSize, sampleRate) {
     return bin * (sampleRate / fftSize);
+  }
+
+  // Quadratic interpolation around FFT peak for sub-bin frequency accuracy
+  function interpolatePeak(data, peakBin, bufLen, sampleRate) {
+    if (peakBin <= 0 || peakBin >= bufLen - 1) return binToFreq(peakBin, FFT_SIZE, sampleRate);
+    const a = data[peakBin - 1];
+    const b = data[peakBin];
+    const c = data[peakBin + 1];
+    const denom = a - 2 * b + c;
+    if (denom === 0) return binToFreq(peakBin, FFT_SIZE, sampleRate);
+    const offset = 0.5 * (a - c) / denom;
+    return (peakBin + offset) * (sampleRate / FFT_SIZE);
   }
 
   // ── Audio Context Init ──
@@ -548,24 +696,25 @@
       lastSentMsgEl = addMessage(text, 'sent');
       log('TX complete — ' + speed.detail);
 
-      // Wait for ACK if listening
+      // Wait for ACKs if listening — collect for full timeout window
       if (isListening) {
         waitingForAck = true;
+        ackCount = 0;
         lastSentMsgEl.querySelector('.meta').textContent += ' — awaiting ACK...';
         setStatus('Waiting for ACK...', 'sending');
-        log('TX: Waiting for ACK...');
+        log('TX: Waiting for ACKs...');
         ackTimeout = setTimeout(() => {
-          if (waitingForAck) {
-            waitingForAck = false;
-            if (lastSentMsgEl) {
-              const meta = lastSentMsgEl.querySelector('.meta');
-              meta.textContent = meta.textContent.replace(' — awaiting ACK...', '') + ' — NO ACK';
+          waitingForAck = false;
+          if (lastSentMsgEl) {
+            const meta = lastSentMsgEl.querySelector('.meta');
+            if (ackCount === 0) {
+              meta.textContent = meta.textContent.replace(/ — awaiting ACK\.\.\.$/, '') + ' — NO ACK';
               meta.classList.add('no-ack');
-              lastSentMsgEl = null;
             }
-            log('TX: ACK timeout — no acknowledgment received');
-            setStatus(isListening ? 'Listening' : 'Idle', isListening ? 'listening' : '');
+            lastSentMsgEl = null;
           }
+          log('TX: ACK window closed — ' + ackCount + ' receiver(s) confirmed');
+          setStatus(isListening ? 'Listening' : 'Idle', isListening ? 'listening' : '');
         }, 5000);
       }
     } catch (e) {
@@ -624,6 +773,7 @@
   function stopListening() {
     isListening = false;
     waitingForAck = false;
+    ackCount = 0;
     if (ackTimeout) { clearTimeout(ackTimeout); ackTimeout = null; }
     if (micStream) {
       micStream.getTracks().forEach(t => t.stop());
@@ -669,30 +819,30 @@
       if (data[i] > peakVal) { peakVal = data[i]; peakBin = i; }
     }
     if (peakVal < DETECT_THRESHOLD) return null;
-    return binToFreq(peakBin, FFT_SIZE, sampleRate);
+    return interpolatePeak(data, peakBin, bufLen, sampleRate);
   }
 
   function detectTones(data, bufLen, sampleRate) {
     let marker = null, chA = null, chB = null;
 
-    // Marker band (17600 – 17950 Hz)
-    const mFreq = findPeak(data, bufLen, 17600, 17950, sampleRate);
+    // Marker band (bandBase+1650 – bandBase+1950)
+    const mFreq = findPeak(data, bufLen, bandBase + 1650, bandBase + 1950, sampleRate);
     if (mFreq !== null) {
       if (Math.abs(mFreq - FREQ_ACK)   < FREQ_TOLERANCE) marker = 'ACK';
       else if (Math.abs(mFreq - FREQ_START) < FREQ_TOLERANCE) marker = 'START';
       else if (Math.abs(mFreq - FREQ_STOP)  < FREQ_TOLERANCE) marker = 'STOP';
     }
 
-    // Channel A – high nibble (18000 – 19500 Hz)
-    const aFreq = findPeak(data, bufLen, 17950, 19550, sampleRate);
+    // Channel A – high nibble (bandBase+2000 – bandBase+3500)
+    const aFreq = findPeak(data, bufLen, bandBase + 1950, bandBase + 3550, sampleRate);
     if (aFreq !== null) {
       for (let n = 0; n < NUM_NIBBLES; n++) {
         if (Math.abs(aFreq - nibbleToFreqA(n)) < FREQ_TOLERANCE) { chA = n; break; }
       }
     }
 
-    // Channel B – low nibble (16000 – 17500 Hz)
-    const bFreq = findPeak(data, bufLen, 15950, 17550, sampleRate);
+    // Channel B – low nibble (bandBase – bandBase+1500)
+    const bFreq = findPeak(data, bufLen, bandBase - 50, bandBase + 1550, sampleRate);
     if (bFreq !== null) {
       for (let n = 0; n < NUM_NIBBLES; n++) {
         if (Math.abs(bFreq - nibbleToFreqB(n)) < FREQ_TOLERANCE) { chB = n; break; }
@@ -731,16 +881,14 @@
         // ACK is always processed (even while sending)
         if (marker === 'ACK') {
           if (waitingForAck) {
-            waitingForAck = false;
-            clearTimeout(ackTimeout);
+            ackCount++;
             if (lastSentMsgEl) {
               const meta = lastSentMsgEl.querySelector('.meta');
-              meta.textContent = meta.textContent.replace(' — awaiting ACK...', '') + ' — ACK';
+              meta.textContent = meta.textContent.replace(/ — awaiting ACK\.\.\.$| — ACK \(\d+\)$/, '')
+                + ' — ACK (' + ackCount + ')';
               meta.classList.add('acked');
-              lastSentMsgEl = null;
             }
-            log('TX: ACK received — delivery confirmed!');
-            setStatus(isListening ? 'Listening' : 'Idle', isListening ? 'listening' : '');
+            log('TX: ACK #' + ackCount + ' received');
           }
         } else if (!isSending) {
           if (marker === 'START' && rxState === RX_IDLE) {
@@ -835,9 +983,11 @@
   }
 
   async function sendAck() {
-    log('RX: Sending ACK...');
-    await silence(500); // pause to let sender's FFT settle after STOP
-    await playTone(FREQ_ACK, 300); // longer tone for reliable detection
+    // Random delay so multiple receivers stagger their ACKs
+    const delay = 500 + Math.floor(Math.random() * 1500);
+    log('RX: Sending ACK in ' + delay + 'ms...');
+    await silence(delay);
+    await playTone(FREQ_ACK, 300);
     log('RX: ACK sent');
   }
 
@@ -858,11 +1008,14 @@
     ctx.fillStyle = '#0d1117';
     ctx.fillRect(0, 0, w, h);
 
-    // Draw full ultrasonic band (15,900 – 19,600 Hz)
-    const binLow  = freqToBin(15900, FFT_SIZE, sampleRate);
-    const binHigh = freqToBin(19600, FFT_SIZE, sampleRate);
+    // Draw full band (bandBase-100 to bandBase+3600)
+    const binLow  = freqToBin(bandBase - 100, FFT_SIZE, sampleRate);
+    const binHigh = freqToBin(bandBase + 3600, FFT_SIZE, sampleRate);
     const numBins = binHigh - binLow + 1;
     const barW = w / numBins;
+
+    const chBTop   = bandBase + 1550;
+    const markerTop = bandBase + 2000;
 
     for (let i = 0; i < numBins; i++) {
       const bin = binLow + i;
@@ -871,10 +1024,10 @@
 
       const freq = binToFreq(bin, FFT_SIZE, sampleRate);
       let color;
-      if (freq < 17550) {
+      if (freq < chBTop) {
         // Channel B (orange)
         color = `hsla(30, 90%, ${30 + val * 40}%, ${0.4 + val * 0.6})`;
-      } else if (freq < 18000) {
+      } else if (freq < markerTop) {
         // Markers (blue)
         color = `rgba(0, 150, 255, ${0.3 + val * 0.7})`;
       } else {
@@ -899,6 +1052,13 @@
   }
 
   // ── Event Handlers ──
+  const bandSelect = document.getElementById('bandSelect');
+  bandSelect.addEventListener('change', () => {
+    const base = parseInt(bandSelect.value, 10);
+    applyBand(base);
+    log('Band changed to ' + (base / 1000) + '–' + ((base + 3500) / 1000) + ' kHz');
+  });
+
   btnSend.addEventListener('click', () => {
     const text = msgInput.value.trim();
     if (!text) return;
