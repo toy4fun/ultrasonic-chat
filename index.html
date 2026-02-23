@@ -281,6 +281,62 @@
     color: #556;
     margin-top: 2px;
   }
+
+  .progress-wrapper {
+    background: #111827;
+    border: 1px solid #1e293b;
+    border-radius: 8px;
+    padding: 8px 12px;
+    display: none;
+  }
+
+  .progress-wrapper.visible { display: block; }
+
+  .progress-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 6px;
+  }
+
+  .progress-label {
+    font-size: 0.8em;
+    font-weight: 600;
+    color: #e0e0e0;
+  }
+
+  .progress-detail {
+    font-size: 0.75em;
+    color: #889;
+    font-family: 'Courier New', monospace;
+  }
+
+  .progress-track {
+    width: 100%;
+    height: 6px;
+    background: #1e293b;
+    border-radius: 3px;
+    overflow: hidden;
+  }
+
+  .progress-fill {
+    height: 100%;
+    width: 0%;
+    border-radius: 3px;
+    transition: width 0.15s ease;
+  }
+
+  .progress-fill.tx { background: linear-gradient(90deg, #ff8800, #ffaa44); }
+  .progress-fill.rx { background: linear-gradient(90deg, #00ff88, #44ffaa); }
+  .progress-fill.rx-pulse {
+    background: linear-gradient(90deg, #00ff88, #44ffaa);
+    animation: pulse-rx 1.2s ease-in-out infinite;
+  }
+
+  @keyframes pulse-rx {
+    0%, 100% { opacity: 0.6; }
+    50% { opacity: 1; }
+  }
 </style>
 </head>
 <body>
@@ -297,26 +353,36 @@
   <div class="freq-select">
     <label for="bandSelect">Band:</label>
     <select id="bandSelect">
-      <option value="12000">12–15.5 kHz (Reliable)</option>
-      <option value="14000">14–17.5 kHz (Balanced)</option>
-      <option value="16000" selected>16–19.5 kHz (Inaudible)</option>
-      <option value="17000">17–20.5 kHz (Ultra-high)</option>
+      <option value="8000">8 kHz (Audible, reliable)</option>
+      <option value="12000">12 kHz (Balanced)</option>
+      <option value="16000" selected>16 kHz (Mostly inaudible)</option>
+      <option value="18000">18 kHz (Ultra-high)</option>
     </select>
-    <label for="toneSelect">Tones:</label>
-    <select id="toneSelect">
-      <option value="1">1 (Slow)</option>
-      <option value="2">2 (Fast)</option>
-      <option value="3" selected>3 (Fastest)</option>
+    <label for="carrierSelect">Carriers:</label>
+    <select id="carrierSelect">
+      <option value="2">2 DQPSK (~25 B/s)</option>
+      <option value="4" selected>4 DQPSK (~50 B/s)</option>
+      <option value="8">8 DQPSK (~100 B/s)</option>
     </select>
     <span class="freq-warn">All devices must match!</span>
+  </div>
+
+  <div class="progress-wrapper" id="progressWrapper">
+    <div class="progress-header">
+      <span class="progress-label" id="progressLabel">Sending...</span>
+      <span class="progress-detail" id="progressDetail">0%</span>
+    </div>
+    <div class="progress-track">
+      <div class="progress-fill" id="progressFill"></div>
+    </div>
   </div>
 
   <div class="visualizer-wrapper">
     <canvas id="spectrum"></canvas>
     <div class="freq-labels" id="freqLabels">
-      <span>Ch B: 16–17.5</span>
-      <span>Markers</span>
-      <span>Ch A: 18–19.5</span>
+      <span>15.2 kHz</span>
+      <span>4 DQPSK carriers</span>
+      <span>17.2 kHz</span>
     </div>
   </div>
 
@@ -355,197 +421,77 @@
   'use strict';
 
   // ══════════════════════════════════════════════════════════════════
-  // FREQUENCY MAP
-  // All frequencies are derived from a single bandBase value (Hz).
-  // Up to 3 channels carry data nibbles in parallel; the user selects
-  // how many (toneCount = 1, 2, or 3). Layout across the spectrum:
+  // DQPSK MODULATION
   //
-  //   Ch C [base-2000 .. base-500]      ← used when toneCount ≥ 3
-  //     500 Hz gap
-  //   Ch B [base .. base+1500]          ← used when toneCount ≥ 2
-  //     200 Hz gap
-  //   Markers  ACK [+1700]  START [+1800]  STOP [+1900]
-  //     100 Hz gap
-  //   Ch A [+2000 .. +3500]             ← always used
+  // Data is encoded as phase *changes* on parallel carriers.
+  // Each symbol period, every carrier shifts its phase by one of
+  // 4 values encoding a 2-bit dibit:
+  //   00 → +0°    01 → +90°    10 → +180°    11 → +270°
   //
-  // Each channel has 16 tone slots (one per nibble 0–15), spaced
-  // FREQ_STEP Hz apart, spanning 1600 Hz of bandwidth.
+  // Frequency layout (relative to bandBase):
+  //   Markers (below carriers):
+  //     base - 800  (START)
+  //     base - 600  (STOP)
+  //     base - 400  (ACK)
+  //   Carriers: base, base+400, base+800, ... base+(N-1)*400
   //
-  // Data is serialized as a nibble stream (2 nibbles per byte) and
-  // sent in groups of toneCount nibbles per tone slot:
-  //   1-tone: 1 nibble/slot on Ch A  → 4 bits/slot  (slowest)
-  //   2-tone: 2 nibbles/slot on A+B  → 8 bits/slot  (1 byte/slot)
-  //   3-tone: 3 nibbles/slot on A+B+C → 12 bits/slot (fastest)
+  // Markers are placed BELOW the carrier band so they stay in a
+  // frequency range that speakers/mics can handle. At 16 kHz base:
+  //   Markers: 15200–15600 Hz, Carriers: 16000–18800 Hz (8 carriers)
+  // Total bandwidth: ~4 kHz
   //
-  // Throughput per slot ≈ TONE_MS_NIBBLE + GAP_MS (default 120 ms):
-  //   1-tone: ~4.2 B/s    2-tone: ~8.3 B/s    3-tone: ~12.5 B/s
-  //
-  // bandBase (Hz): Starting frequency of Channel B. Controls where the
-  //   entire protocol sits in the spectrum. Lower = more reliable but
-  //   more audible. Higher = less audible but hardware may roll off.
-  //   At bandBase=16000 the full 3-channel range is 14000–19500 Hz.
-  //   Typical values: 12000 (reliable), 14000 (balanced), 16000 (inaudible).
-  //   All communicating devices MUST use the same bandBase.
+  // Data rate:  numCarriers * 2 bits / SYMBOL_MS
+  //   4 carriers @ 20ms → 400 bits/s = 50 bytes/s
+  //   8 carriers @ 20ms → 800 bits/s = 100 bytes/s
   // ══════════════════════════════════════════════════════════════════
-  let bandBase   = 16000;
-  let FREQ_BASE_C, FREQ_BASE_B, FREQ_ACK, FREQ_START, FREQ_STOP, FREQ_BASE_A;
 
-  // FREQ_STEP (Hz): Spacing between adjacent tone frequencies within a
-  //   channel. Each nibble (0–15) maps to channelBase + nibble × FREQ_STEP.
-  //   Must be large enough for the FFT to resolve (> 2× bin width).
-  //   At FFT 2048 / 44100 Hz, bin width ≈ 21.5 Hz, so 100 Hz gives
-  //   ~4.6 bins of separation — comfortable margin. Smaller values pack
-  //   more tones into less bandwidth but increase misdetection risk.
-  const FREQ_STEP   = 100;
+  const CARRIER_SPACING = 400;   // Hz between adjacent carriers
+  const MAX_CARRIERS    = 8;     // max supported carrier count
+  const SYMBOL_MS       = 20;    // ms per DQPSK symbol
+  const MARKER_MS       = 100;   // ms for START/STOP/ACK tones
+  const GAP_MS          = 50;    // ms silence after START / before STOP
+  const SAMPLE_RATE     = 44100;
+  const FFT_SIZE        = 4096;  // AnalyserNode fftSize (visualization + RX)
 
-  // NUM_NIBBLES: Number of distinct tone frequencies per channel.
-  //   16 = 4 bits per nibble (one hex digit). Each channel uses
-  //   NUM_NIBBLES × FREQ_STEP = 1600 Hz of bandwidth. Payload bytes
-  //   are split into nibble streams and distributed across toneCount
-  //   channels, so each tone slot carries toneCount × 4 bits.
-  const NUM_NIBBLES = 16;
+  // Phase offsets for DQPSK dibits
+  const DIBIT_PHASE = [0, Math.PI / 2, Math.PI, 3 * Math.PI / 2];
+
+  let bandBase    = 16000;
+  let numCarriers = 4;
+
+  // Derived frequencies (recomputed by applyBand/recomputeFreqs)
+  let carrierFreqs = [];
+  let FREQ_START, FREQ_STOP, FREQ_ACK;
 
   function applyBand(base) {
-    bandBase    = base;
-    FREQ_BASE_C = base - 2000;   // Channel C starts 2000 Hz below base
-    FREQ_BASE_B = base;          // Channel B starts at bandBase
-    FREQ_ACK    = base + 1700;   // ACK marker tone
-    FREQ_START  = base + 1800;   // START-of-message marker tone
-    FREQ_STOP   = base + 1900;   // STOP / end-of-message marker tone
-    FREQ_BASE_A = base + 2000;   // Channel A starts 2000 Hz above base
-
-    const cLo = ((base - 2000) / 1000).toFixed(0);
-    const cHi = ((base - 500) / 1000).toFixed(1);
-    const bLo = (base / 1000).toFixed(0);
-    const bHi = ((base + 1500) / 1000).toFixed(1);
-    const aLo = ((base + 2000) / 1000).toFixed(0);
-    const aHi = ((base + 3500) / 1000).toFixed(1);
-    const labels = document.getElementById('freqLabels');
-    if (labels) {
-      labels.children[0].textContent = 'C: ' + cLo + '–' + cHi;
-      labels.children[1].textContent = 'B: ' + bLo + '–' + bHi + '  Mkr';
-      labels.children[2].textContent = 'A: ' + aLo + '–' + aHi;
-    }
+    bandBase = base;
+    recomputeFreqs();
   }
 
-  applyBand(16000);
+  function recomputeFreqs() {
+    carrierFreqs = [];
+    for (let i = 0; i < numCarriers; i++) {
+      carrierFreqs.push(bandBase + i * CARRIER_SPACING);
+    }
+    // Markers sit BELOW the carrier band — reliable on all hardware
+    FREQ_START = bandBase - 800;
+    FREQ_STOP  = bandBase - 600;
+    FREQ_ACK   = bandBase - 400;
 
-  // toneCount: Number of simultaneous data tones per slot (1, 2, or 3).
-  //   Controls the throughput / reliability trade-off:
-  //     1 = Ch A only. Most reliable — only one tone to detect per slot.
-  //         4 bits/slot → ~4.2 B/s at default timing. Best for noisy
-  //         environments, long distances, or weak speakers.
-  //     2 = Ch A + Ch B. Good balance — two tones, 8 bits/slot (1 byte).
-  //         ~8.3 B/s at default timing.
-  //     3 = Ch A + Ch B + Ch C. Fastest — three tones, 12 bits/slot.
-  //         ~12.5 B/s at default timing. Requires all 3 frequency bands
-  //         to be within speaker/mic range (total span: 5500 Hz).
-  //   All communicating devices MUST use the same toneCount.
-  //   Changed at runtime via the "Tones" dropdown in the UI.
-  let toneCount = 3;
+    updateFreqLabels();
+  }
 
-  // ══════════════════════════════════════════════════════════════════
-  // TIMING
-  // These three values control the raw speed of the protocol.
-  // Effective data rate = toneCount × 4 bits / (TONE_MS_NIBBLE + GAP_MS).
-  // Example at defaults (80 + 40 = 120 ms/slot):
-  //   1-tone: 4 bits / 120 ms ≈ 4.2 B/s
-  //   2-tone: 8 bits / 120 ms ≈ 8.3 B/s
-  //   3-tone: 12 bits / 120 ms ≈ 12.5 B/s
-  // ══════════════════════════════════════════════════════════════════
+  function updateFreqLabels() {
+    const labels = document.getElementById('freqLabels');
+    if (!labels) return;
+    const lo = (FREQ_START / 1000).toFixed(1);
+    const hiCarrier = (carrierFreqs[numCarriers - 1] / 1000).toFixed(1);
+    labels.children[0].textContent = lo + ' kHz';
+    labels.children[1].textContent = numCarriers + ' DQPSK carriers';
+    labels.children[2].textContent = hiCarrier + ' kHz';
+  }
 
-  // TONE_MS_MARKER (ms): Duration of marker tones (START, STOP, ACK).
-  //   These are single-frequency tones used for framing, not data.
-  //   Longer = more reliable detection, shorter = less protocol overhead.
-  //   Must be > FFT window (FFT_SIZE / SAMPLE_RATE ≈ 46 ms at 2048/44100)
-  //   and long enough for CONFIRM_FRAMES consecutive FFT hits.
-  //   Recommended: 100–200 ms.
-  const TONE_MS_MARKER  = 120;
-
-  // TONE_MS_NIBBLE (ms): Duration of each data tone slot.
-  //   One slot carries toneCount nibbles simultaneously (1–3 tones).
-  //   Must be > FFT window so at least CONFIRM_FRAMES clean FFT frames
-  //   fit inside the tone. At 2048/44100 the FFT window is ~46 ms;
-  //   at 60 fps each frame ≈ 16 ms. 80 ms gives ~2 clean frames
-  //   after the first detection, enough for CONFIRM_FRAMES = 3.
-  //   Recommended: 60–120 ms. Lower = faster but less reliable.
-  const TONE_MS_NIBBLE  = 80;
-
-  // GAP_MS (ms): Silent gap between consecutive tone slots.
-  //   Allows the FFT to register silence between slots, resetting the
-  //   tone confirmation counters so the next slot is detected as a
-  //   fresh event. Also prevents spectral smearing between different
-  //   tone values in adjacent slots.
-  //   Must be long enough for ≥1 FFT frame of silence (~16 ms at 60 fps).
-  //   Recommended: 30–80 ms. Lower = faster but may cause tone bleed.
-  const GAP_MS          = 40;
-
-  // ══════════════════════════════════════════════════════════════════
-  // FFT / DETECTION
-  // The receiver runs an FFT every animation frame and searches for
-  // peaks in each channel band + the marker band. A tone is accepted
-  // only after CONFIRM_FRAMES consecutive frames show the same value.
-  // ══════════════════════════════════════════════════════════════════
-
-  // FFT_SIZE: Number of samples in each FFT analysis window.
-  //   Determines frequency resolution: bin_width = SAMPLE_RATE / FFT_SIZE.
-  //   Also determines time window: FFT_SIZE / SAMPLE_RATE seconds.
-  //   2048 → 21.5 Hz bins, 46 ms window (good balance for 100 Hz steps).
-  //   4096 → 10.7 Hz bins, 93 ms window (better resolution but tones
-  //          must be ≥93 ms or the FFT smears across tone boundaries).
-  //   Must be a power of 2. Recommended: 2048 for 80 ms tones.
-  //   Note: with 3 channels spanning 5500 Hz (bandBase−2000 to
-  //   bandBase+3500), the FFT must resolve all 48 possible data tones
-  //   plus 3 marker tones. 21.5 Hz bins give ~4.6 bins per FREQ_STEP.
-  const FFT_SIZE    = 2048;
-
-  // SAMPLE_RATE (Hz): Audio sample rate for both playback and recording.
-  //   44100 = CD quality, Nyquist at 22050 Hz. Sufficient for all bands
-  //     up to bandBase=17000 (Ch A tops out at 20500 Hz < 22050 Hz).
-  //   48000 = common native rate, Nyquist at 24000 Hz. More headroom
-  //     for high bandBase values or when the browser resamples.
-  //   The browser may override this with the device's native rate.
-  const SAMPLE_RATE = 44100;
-
-  // FREQ_TOLERANCE (Hz): Maximum allowed deviation between a detected
-  //   FFT peak and a known tone frequency to count as a match.
-  //   With FREQ_STEP=100 and tolerance=35, adjacent tones have a 30 Hz
-  //   dead zone between them (100 − 2×35 = 30), preventing overlap.
-  //   Quadratic peak interpolation improves raw bin accuracy to ~2–5 Hz,
-  //   so 35 Hz is generous. Applied identically to all 3 data channels
-  //   and the marker band.
-  //   Increase if getting false negatives (missed tones).
-  //   Decrease if getting false positives (wrong nibble values).
-  //   Must be < FREQ_STEP / 2 to avoid matching the wrong tone.
-  const FREQ_TOLERANCE = 35;
-
-  // DETECT_THRESHOLD (0–255): Minimum FFT magnitude to consider a peak
-  //   as an actual tone vs background noise. The FFT returns byte values
-  //   0–255 where 0 = silence and 255 = max amplitude.
-  //   Applied per-channel: each of Ch A, B, C and the marker band is
-  //   searched independently for a peak above this threshold.
-  //   Lower = more sensitive (good for weak signals / long distance)
-  //   but more prone to noise false positives.
-  //   Higher = ignores noise but may miss quiet tones.
-  //   With 3 simultaneous tones the per-tone amplitude is 0.6
-  //   (vs 0.8 for single marker tones), so keep this low enough
-  //   to detect the weaker individual tones.
-  //   Recommended: 15–40. Start at 20, lower if tones are not detected.
-  const DETECT_THRESHOLD = 20;
-
-  // CONFIRM_FRAMES: Number of consecutive FFT frames that must show
-  //   the same detected tone(s) before the slot is accepted.
-  //   For markers: the same marker type (START/STOP/ACK) must appear
-  //     in CONFIRM_FRAMES consecutive frames.
-  //   For data: all toneCount channels must show the same nibble values
-  //     for CONFIRM_FRAMES consecutive frames.
-  //   Prevents transient noise spikes from being treated as valid data.
-  //   At ~60 fps, each frame ≈ 16 ms; 3 frames ≈ 50 ms.
-  //   Higher = more reliable but slower (tone must last longer).
-  //   Lower = faster but more false positives.
-  //   Must satisfy: CONFIRM_FRAMES × frame_time < TONE_MS_NIBBLE.
-  //   Recommended: 2–4.
-  const CONFIRM_FRAMES = 3;
+  recomputeFreqs();
 
   // ── DOM Elements ──
   const statusDot  = document.getElementById('statusDot');
@@ -563,33 +509,71 @@
   const rxDetailEl = document.getElementById('rxDetail');
   const ctx        = canvas.getContext('2d');
 
+  const progressWrapper = document.getElementById('progressWrapper');
+  const progressLabel   = document.getElementById('progressLabel');
+  const progressDetail  = document.getElementById('progressDetail');
+  const progressFill    = document.getElementById('progressFill');
+
+  function showProgress(label, mode) {
+    progressWrapper.classList.add('visible');
+    progressLabel.textContent = label;
+    progressDetail.textContent = '0%';
+    progressFill.style.width = '0%';
+    progressFill.className = 'progress-fill ' + (mode || 'tx');
+  }
+
+  function updateProgress(pct, detail) {
+    progressFill.style.width = Math.min(100, pct).toFixed(1) + '%';
+    progressDetail.textContent = detail || (Math.round(pct) + '%');
+  }
+
+  function hideProgress() {
+    progressWrapper.classList.remove('visible');
+  }
+
   // ── State ──
   let audioCtx       = null;
   let analyser       = null;
   let micStream      = null;
+  let micSource      = null;
   let isListening    = false;
   let isSending      = false;
   let animFrameId    = null;
+  let timeDomainBuf  = null; // Float32Array for AnalyserNode time-domain data
+  let lastPollTime   = 0;    // timestamp of last pollSpectrum call
 
-  // Receiver state machine
+  // RX state machine
   const RX_IDLE      = 0;
-  const RX_RECEIVING = 1;
+  const RX_SYNC      = 1;  // waiting through post-START silence
+  const RX_REFERENCE = 2;  // capturing reference symbol phases
+  const RX_DATA      = 3;  // decoding data symbols
   let rxState        = RX_IDLE;
-  let rxNibbles      = [];
-  let lastSignalTime = 0;
 
-  // Marker confirmation (ACK / START / STOP)
-  let lastMarker     = null;
-  let markerConfirm  = 0;
+  // RX sample accumulation
+  let rxSampleBuf    = new Float32Array(0);
+  let rxSampleCount  = 0;
 
-  // Tri-channel data confirmation
-  let lastTriA       = null;
-  let lastTriB       = null;
-  let lastTriC       = null;
-  let triConfirm     = 0;
+  // RX DQPSK state
+  let prevPhases     = [];   // reference phases per carrier
+  let rxDibits       = [];   // accumulated received dibits
+  let rxStartTime    = 0;
+  let symbolSamples  = 0;    // samples per symbol (computed from actual sample rate)
+  let gapSamples     = 0;    // samples for the sync gap
+  let markerSamples  = 0;    // samples for a marker tone
+
+  // Goertzel energy tracking for marker detection in IDLE
+  let markerDetectCount = 0;
+  const MARKER_CONFIRM  = 2; // consecutive Goertzel hits to confirm marker
+  let idleLogTimer      = 0; // throttle diagnostic logging in IDLE
+  let rxCallbackCount   = 0; // heartbeat counter for ScriptProcessorNode
+
+  // For visualizer overlay
+  let rxStateLabel   = 'IDLE';
+  let lastDibitStr   = '';
+  let rxSyncEnterSampleCount = 0; // samples consumed in SYNC state
 
   // Speed measurement state
-  let rxStartTime    = 0;
+  // (rxStartTime declared above)
 
   // ACK state
   let waitingForAck  = false;
@@ -600,7 +584,7 @@
   // ── Helpers ──
   function log(msg) {
     const line = document.createElement('div');
-    line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+    line.textContent = '[' + new Date().toLocaleTimeString() + '] ' + msg;
     debugLog.appendChild(line);
     debugLog.scrollTop = debugLog.scrollHeight;
   }
@@ -647,36 +631,12 @@
     return crc;
   }
 
-  function nibbleToFreqA(n) {
-    return FREQ_BASE_A + n * FREQ_STEP;
-  }
-
-  function nibbleToFreqB(n) {
-    return FREQ_BASE_B + n * FREQ_STEP;
-  }
-
-  function nibbleToFreqC(n) {
-    return FREQ_BASE_C + n * FREQ_STEP;
-  }
-
   function freqToBin(freq, fftSize, sampleRate) {
     return Math.round(freq / (sampleRate / fftSize));
   }
 
   function binToFreq(bin, fftSize, sampleRate) {
     return bin * (sampleRate / fftSize);
-  }
-
-  // Quadratic interpolation around FFT peak for sub-bin frequency accuracy
-  function interpolatePeak(data, peakBin, bufLen, sampleRate) {
-    if (peakBin <= 0 || peakBin >= bufLen - 1) return binToFreq(peakBin, FFT_SIZE, sampleRate);
-    const a = data[peakBin - 1];
-    const b = data[peakBin];
-    const c = data[peakBin + 1];
-    const denom = a - 2 * b + c;
-    if (denom === 0) return binToFreq(peakBin, FFT_SIZE, sampleRate);
-    const offset = 0.5 * (a - c) / denom;
-    return (peakBin + offset) * (sampleRate / FFT_SIZE);
   }
 
   // ── Audio Context Init ──
@@ -690,100 +650,142 @@
     return audioCtx;
   }
 
-  // ── Tone Generation ──
+  // ══════════════════════════════════════════════════════════════════
+  // TX PIPELINE — pre-computed DQPSK waveform
+  // ══════════════════════════════════════════════════════════════════
+
+  function generateDQPSKWaveform(bytes, sr) {
+    const nc = numCarriers;
+
+    // Convert bytes to bit stream, then to dibits (2 bits each)
+    const dibits = [];
+    for (let i = 0; i < bytes.length; i++) {
+      dibits.push((bytes[i] >> 6) & 0x03);
+      dibits.push((bytes[i] >> 4) & 0x03);
+      dibits.push((bytes[i] >> 2) & 0x03);
+      dibits.push(bytes[i] & 0x03);
+    }
+    // Pad to multiple of numCarriers
+    while (dibits.length % nc !== 0) dibits.push(0);
+
+    const numSymbols = dibits.length / nc;
+    const symSamples = Math.round(sr * SYMBOL_MS / 1000);
+    const mrkSamples = Math.round(sr * MARKER_MS / 1000);
+    const gapSamp    = Math.round(sr * GAP_MS / 1000);
+    const postGap    = Math.round(sr * 20 / 1000); // short gap before STOP
+
+    // Reference symbol is 3x symbol duration for timing margin
+    const refSamples = symSamples * 3;
+    // Total length: START + gap + reference + data symbols + gap + STOP
+    const totalSamples = mrkSamples + gapSamp + refSamples + (numSymbols * symSamples) + postGap + mrkSamples;
+    const waveform = new Float32Array(totalSamples);
+
+    let pos = 0;
+    const TWO_PI = 2 * Math.PI;
+
+    // Helper: write a single-frequency tone into waveform at position
+    function writeTone(freq, samples, amplitude) {
+      for (let s = 0; s < samples; s++) {
+        // Soft envelope: 2ms ramp at edges
+        const rampSamples = Math.round(sr * 0.002);
+        let env = 1.0;
+        if (s < rampSamples) env = s / rampSamples;
+        else if (s > samples - rampSamples) env = (samples - s) / rampSamples;
+        waveform[pos + s] += amplitude * env * Math.sin(TWO_PI * freq * s / sr);
+      }
+    }
+
+    // 1. START marker
+    writeTone(FREQ_START, mrkSamples, 0.7);
+    pos += mrkSamples;
+
+    // 2. Silence gap
+    pos += gapSamp;
+
+    // 3. Reference symbol — all carriers at phase 0 (no data, establishes reference)
+    const amp = 0.7 / nc; // amplitude per carrier
+    const phaseAccum = new Float64Array(nc); // accumulated phase per carrier (radians)
+    const carrierPhasePerSample = new Float64Array(nc);
+    for (let c = 0; c < nc; c++) {
+      carrierPhasePerSample[c] = TWO_PI * carrierFreqs[c] / sr;
+    }
+
+    // Write reference symbol (3x symbol duration for timing margin)
+    for (let s = 0; s < refSamples; s++) {
+      let sample = 0;
+      const rampSamples = Math.min(Math.round(sr * 0.001), Math.floor(refSamples / 4));
+      let env = 1.0;
+      if (s < rampSamples) env = s / rampSamples;
+      else if (s > refSamples - rampSamples) env = (refSamples - s) / rampSamples;
+      for (let c = 0; c < nc; c++) {
+        sample += amp * env * Math.sin(phaseAccum[c]);
+        phaseAccum[c] += carrierPhasePerSample[c];
+      }
+      waveform[pos + s] = sample;
+    }
+    pos += refSamples;
+
+    // 4. Data symbols
+    for (let sym = 0; sym < numSymbols; sym++) {
+      // Apply phase jumps for this symbol's dibits
+      for (let c = 0; c < nc; c++) {
+        const dibit = dibits[sym * nc + c];
+        phaseAccum[c] += DIBIT_PHASE[dibit];
+      }
+
+      for (let s = 0; s < symSamples; s++) {
+        let sample = 0;
+        const rampSamples = Math.min(Math.round(sr * 0.001), Math.floor(symSamples / 4));
+        let env = 1.0;
+        if (s < rampSamples) env = s / rampSamples;
+        else if (s > symSamples - rampSamples) env = (symSamples - s) / rampSamples;
+        for (let c = 0; c < nc; c++) {
+          sample += amp * env * Math.sin(phaseAccum[c]);
+          phaseAccum[c] += carrierPhasePerSample[c];
+        }
+        waveform[pos + s] = sample;
+      }
+      pos += symSamples;
+    }
+
+    // 5. Short gap before STOP
+    pos += postGap;
+
+    // 6. STOP marker
+    writeTone(FREQ_STOP, mrkSamples, 0.7);
+    pos += mrkSamples;
+
+    return { waveform, numSymbols, symSamples };
+  }
+
+  function playWaveform(float32Array) {
+    return new Promise(resolve => {
+      const actx = ensureAudioCtx();
+      const buffer = actx.createBuffer(1, float32Array.length, actx.sampleRate);
+      buffer.getChannelData(0).set(float32Array);
+      const source = actx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(actx.destination);
+      source.onended = resolve;
+      source.start();
+    });
+  }
+
   function playTone(freq, durationMs) {
     return new Promise(resolve => {
-      const ctx = ensureAudioCtx();
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-
+      const actx = ensureAudioCtx();
+      const osc = actx.createOscillator();
+      const gain = actx.createGain();
       osc.type = 'sine';
-      osc.frequency.setValueAtTime(freq, ctx.currentTime);
-
-      // Gentle ramp to avoid clicks
-      gain.gain.setValueAtTime(0, ctx.currentTime);
-      gain.gain.linearRampToValueAtTime(0.8, ctx.currentTime + 0.005);
-      gain.gain.setValueAtTime(0.8, ctx.currentTime + durationMs / 1000 - 0.005);
-      gain.gain.linearRampToValueAtTime(0, ctx.currentTime + durationMs / 1000);
-
+      osc.frequency.setValueAtTime(freq, actx.currentTime);
+      gain.gain.setValueAtTime(0, actx.currentTime);
+      gain.gain.linearRampToValueAtTime(0.7, actx.currentTime + 0.005);
+      gain.gain.setValueAtTime(0.7, actx.currentTime + durationMs / 1000 - 0.005);
+      gain.gain.linearRampToValueAtTime(0, actx.currentTime + durationMs / 1000);
       osc.connect(gain);
-      gain.connect(ctx.destination);
-
-      osc.start(ctx.currentTime);
-      osc.stop(ctx.currentTime + durationMs / 1000 + 0.01);
-
-      setTimeout(resolve, durationMs);
-    });
-  }
-
-  function playDualTone(freqA, freqB, durationMs) {
-    return new Promise(resolve => {
-      const ctx = ensureAudioCtx();
-      const oscA = ctx.createOscillator();
-      const oscB = ctx.createOscillator();
-      const gainA = ctx.createGain();
-      const gainB = ctx.createGain();
-
-      oscA.type = 'sine';
-      oscA.frequency.setValueAtTime(freqA, ctx.currentTime);
-      oscB.type = 'sine';
-      oscB.frequency.setValueAtTime(freqB, ctx.currentTime);
-
-      const dur = durationMs / 1000;
-      [gainA, gainB].forEach(g => {
-        g.gain.setValueAtTime(0, ctx.currentTime);
-        g.gain.linearRampToValueAtTime(0.7, ctx.currentTime + 0.005);
-        g.gain.setValueAtTime(0.7, ctx.currentTime + dur - 0.005);
-        g.gain.linearRampToValueAtTime(0, ctx.currentTime + dur);
-      });
-
-      oscA.connect(gainA); gainA.connect(ctx.destination);
-      oscB.connect(gainB); gainB.connect(ctx.destination);
-
-      oscA.start(ctx.currentTime);
-      oscB.start(ctx.currentTime);
-      oscA.stop(ctx.currentTime + dur + 0.01);
-      oscB.stop(ctx.currentTime + dur + 0.01);
-
-      setTimeout(resolve, durationMs);
-    });
-  }
-
-  function playTriTone(freqA, freqB, freqC, durationMs) {
-    return new Promise(resolve => {
-      const ctx = ensureAudioCtx();
-      const oscA = ctx.createOscillator();
-      const oscB = ctx.createOscillator();
-      const oscC = ctx.createOscillator();
-      const gainA = ctx.createGain();
-      const gainB = ctx.createGain();
-      const gainC = ctx.createGain();
-
-      oscA.type = 'sine';
-      oscA.frequency.setValueAtTime(freqA, ctx.currentTime);
-      oscB.type = 'sine';
-      oscB.frequency.setValueAtTime(freqB, ctx.currentTime);
-      oscC.type = 'sine';
-      oscC.frequency.setValueAtTime(freqC, ctx.currentTime);
-
-      const dur = durationMs / 1000;
-      const amp = 0.6; // per-tone amplitude (3 tones, keep total reasonable)
-      [gainA, gainB, gainC].forEach(g => {
-        g.gain.setValueAtTime(0, ctx.currentTime);
-        g.gain.linearRampToValueAtTime(amp, ctx.currentTime + 0.005);
-        g.gain.setValueAtTime(amp, ctx.currentTime + dur - 0.005);
-        g.gain.linearRampToValueAtTime(0, ctx.currentTime + dur);
-      });
-
-      oscA.connect(gainA); gainA.connect(ctx.destination);
-      oscB.connect(gainB); gainB.connect(ctx.destination);
-      oscC.connect(gainC); gainC.connect(ctx.destination);
-
-      [oscA, oscB, oscC].forEach(o => {
-        o.start(ctx.currentTime);
-        o.stop(ctx.currentTime + dur + 0.01);
-      });
-
+      gain.connect(actx.destination);
+      osc.start(actx.currentTime);
+      osc.stop(actx.currentTime + durationMs / 1000 + 0.01);
       setTimeout(resolve, durationMs);
     });
   }
@@ -792,54 +794,41 @@
     return new Promise(resolve => setTimeout(resolve, durationMs));
   }
 
-  // ── Shared nibble-stream transmitter ──
-  // Converts bytes to nibbles, appends CRC, sends in groups of toneCount.
+  // ── Shared DQPSK transmitter ──
   async function transmitBytes(bytes) {
-    const tc = toneCount;
+    const nc = numCarriers;
     const hash = crc8(bytes);
     log('TX: CRC-8 = 0x' + hash.toString(16).toUpperCase().padStart(2, '0') +
-        ' (' + (bytes.length + 1) + ' bytes, ' + tc + '-tone mode)');
+        ' (' + (bytes.length + 1) + ' bytes, ' + nc + '-carrier DQPSK)');
 
-    // Convert bytes + CRC to nibble stream
+    // Append CRC byte
     const allBytes = new Uint8Array(bytes.length + 1);
     allBytes.set(bytes);
     allBytes[bytes.length] = hash;
 
-    const nibbles = [];
-    for (let i = 0; i < allBytes.length; i++) {
-      nibbles.push((allBytes[i] >> 4) & 0x0F);
-      nibbles.push(allBytes[i] & 0x0F);
-    }
-    // Pad to multiple of toneCount
-    while (nibbles.length % tc !== 0) nibbles.push(0);
+    const sr = ensureAudioCtx().sampleRate;
+    const { waveform, numSymbols } = generateDQPSKWaveform(allBytes, sr);
 
-    // START marker
-    await playTone(FREQ_START, TONE_MS_MARKER);
-    await silence(GAP_MS);
+    showProgress('Sending...', 'tx');
+    updateProgress(0, '0 / ' + numSymbols + ' symbols');
 
-    // Send nibbles in groups of toneCount
-    for (let i = 0; i < nibbles.length; i += tc) {
-      if (tc === 1) {
-        await playTone(nibbleToFreqA(nibbles[i]), TONE_MS_NIBBLE);
-      } else if (tc === 2) {
-        await playDualTone(
-          nibbleToFreqA(nibbles[i]),
-          nibbleToFreqB(nibbles[i + 1]),
-          TONE_MS_NIBBLE
-        );
-      } else {
-        await playTriTone(
-          nibbleToFreqA(nibbles[i]),
-          nibbleToFreqB(nibbles[i + 1]),
-          nibbleToFreqC(nibbles[i + 2]),
-          TONE_MS_NIBBLE
-        );
-      }
-      await silence(GAP_MS);
-    }
+    // Play the entire waveform at once
+    // Update progress periodically during playback
+    const totalMs = (waveform.length / sr) * 1000;
+    const startTime = performance.now();
 
-    // STOP marker
-    await playTone(FREQ_STOP, TONE_MS_MARKER);
+    const progressInterval = setInterval(() => {
+      const elapsed = performance.now() - startTime;
+      const pct = Math.min(100, (elapsed / totalMs) * 100);
+      const symsDone = Math.min(numSymbols, Math.floor((pct / 100) * numSymbols));
+      updateProgress(pct, symsDone + ' / ' + numSymbols + ' symbols');
+    }, 50);
+
+    await playWaveform(waveform);
+
+    clearInterval(progressInterval);
+    updateProgress(100, 'Done');
+    hideProgress();
 
     return bytes.length;
   }
@@ -983,259 +972,392 @@
     return div;
   }
 
-  // ── Microphone & Reception ──
-  async function startListening() {
-    try {
-      ensureAudioCtx();
+  // ══════════════════════════════════════════════════════════════════
+  // RX PIPELINE — ScriptProcessorNode + I/Q correlator
+  // ══════════════════════════════════════════════════════════════════
 
-      micStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false,
-          sampleRate: SAMPLE_RATE
-        }
-      });
-
-      const source = audioCtx.createMediaStreamSource(micStream);
-      analyser = audioCtx.createAnalyser();
-      analyser.fftSize = FFT_SIZE;
-      analyser.smoothingTimeConstant = 0.1;
-      source.connect(analyser);
-
-      isListening = true;
-      rxState = RX_IDLE;
-      rxNibbles = [];
-      lastMarker = null;
-      markerConfirm = 0;
-      lastTriA = null;
-      lastTriB = null;
-      lastTriC = null;
-      triConfirm = 0;
-      lastSignalTime = performance.now();
-
-      btnListen.disabled = true;
-      btnStop.disabled = false;
-      setStatus('Listening', 'listening');
-      log('Listening started');
-
-      pollSpectrum();
-    } catch (e) {
-      log('Mic error: ' + e.message);
-      alert('Microphone access denied or unavailable.\n' + e.message);
+  // Goertzel filter: returns magnitude^2 for a single target frequency
+  function goertzel(samples, offset, length, targetFreq, sr) {
+    const k = Math.round(length * targetFreq / sr);
+    const w = 2 * Math.PI * k / length;
+    const cosw = Math.cos(w);
+    const coeff = 2 * cosw;
+    let s0 = 0, s1 = 0, s2 = 0;
+    for (let i = 0; i < length; i++) {
+      s0 = samples[offset + i] + coeff * s1 - s2;
+      s2 = s1;
+      s1 = s0;
     }
+    // Return magnitude (not magnitude^2) normalized by length
+    const real = s1 - s2 * cosw;
+    const imag = s2 * Math.sin(w);
+    return Math.sqrt(real * real + imag * imag) / length;
   }
 
-  function stopListening() {
-    isListening = false;
-    waitingForAck = false;
-    ackCount = 0;
-    if (ackTimeout) { clearTimeout(ackTimeout); ackTimeout = null; }
-    if (micStream) {
-      micStream.getTracks().forEach(t => t.stop());
-      micStream = null;
+  // I/Q correlator: returns phase angle of a carrier in a sample window
+  function measurePhase(samples, offset, length, carrierFreq, sr) {
+    let sumI = 0, sumQ = 0;
+    const TWO_PI = 2 * Math.PI;
+    for (let i = 0; i < length; i++) {
+      const t = i / sr;
+      sumI += samples[offset + i] * Math.cos(TWO_PI * carrierFreq * t);
+      sumQ += samples[offset + i] * Math.sin(TWO_PI * carrierFreq * t);
     }
-    if (animFrameId) {
-      cancelAnimationFrame(animFrameId);
-      animFrameId = null;
-    }
-    analyser = null;
-    rxState = RX_IDLE;
-    rxNibbles = [];
-
-    btnListen.disabled = false;
-    btnStop.disabled = true;
-    setStatus('Idle', '');
-    log('Listening stopped');
+    return Math.atan2(sumQ, sumI);
   }
 
-  // ── Spectrum Analysis & Decoding ──
-  function pollSpectrum() {
-    if (!isListening || !analyser) return;
+  // Normalize angle to [0, 2*PI)
+  function normAngle(a) {
+    a = a % (2 * Math.PI);
+    if (a < 0) a += 2 * Math.PI;
+    return a;
+  }
 
-    const bufLen = analyser.frequencyBinCount;
-    const dataArray = new Uint8Array(bufLen);
-    analyser.getByteFrequencyData(dataArray);
+  // Map a phase difference to the nearest dibit
+  function phaseDiffToDibit(diff) {
+    diff = normAngle(diff);
+    // Decision boundaries at pi/4, 3pi/4, 5pi/4, 7pi/4
+    if (diff < Math.PI / 4 || diff >= 7 * Math.PI / 4) return 0; // ~0°
+    if (diff < 3 * Math.PI / 4) return 1;                         // ~90°
+    if (diff < 5 * Math.PI / 4) return 2;                         // ~180°
+    return 3;                                                      // ~270°
+  }
 
+  // Check if a marker tone is present in a sample block.
+  // Uses adaptive threshold: marker must be > absolute floor AND
+  // significantly above the average energy of non-marker frequencies.
+  function detectMarker(samples, offset, length, sr) {
+    const floor = 0.0005; // absolute minimum magnitude
+    const startMag = goertzel(samples, offset, length, FREQ_START, sr);
+    const stopMag  = goertzel(samples, offset, length, FREQ_STOP, sr);
+    const ackMag   = goertzel(samples, offset, length, FREQ_ACK, sr);
+
+    // Measure noise floor from frequencies well outside marker AND carrier bands
+    const noiseMag1 = goertzel(samples, offset, length, FREQ_START - 500, sr);
+    const noiseMag2 = goertzel(samples, offset, length, FREQ_START - 700, sr);
+    const noiseFloor = (noiseMag1 + noiseMag2) / 2;
+    const threshold = Math.max(floor, noiseFloor * 2);
+
+    if (startMag > threshold && startMag > stopMag && startMag > ackMag) return { type: 'START', mag: startMag, thr: threshold };
+    if (stopMag > threshold && stopMag > startMag && stopMag > ackMag) return { type: 'STOP', mag: stopMag, thr: threshold };
+    if (ackMag > threshold && ackMag > startMag && ackMag > stopMag) return { type: 'ACK', mag: ackMag, thr: threshold };
+    return null;
+  }
+
+  // Check if carriers are present (energy on carrier frequencies)
+  function carriersPresent(samples, offset, length, sr) {
+    const floor = 0.0003;
+    let totalMag = 0;
+    for (let c = 0; c < numCarriers; c++) {
+      totalMag += goertzel(samples, offset, length, carrierFreqs[c], sr);
+    }
+    // Average carrier magnitude must exceed floor
+    return (totalMag / numCarriers) > floor;
+  }
+
+  // Main RX sample processor — fed from pollSpectrum via AnalyserNode
+  function feedRxSamples(newSamples, count) {
+    if (!isListening) return;
+    if (count <= 0) return;
     const sr = audioCtx.sampleRate;
 
-    drawSpectrum(dataArray, bufLen, sr);
-
-    const result = detectTones(dataArray, bufLen, sr);
-    processTones(result);
-
-    animFrameId = requestAnimationFrame(pollSpectrum);
-  }
-
-  function findPeak(data, bufLen, freqLow, freqHigh, sampleRate) {
-    const binLow  = freqToBin(freqLow, FFT_SIZE, sampleRate);
-    const binHigh = freqToBin(freqHigh, FFT_SIZE, sampleRate);
-    let peakBin = -1, peakVal = 0;
-    for (let i = binLow; i <= binHigh && i < bufLen; i++) {
-      if (data[i] > peakVal) { peakVal = data[i]; peakBin = i; }
+    // Heartbeat logging
+    rxCallbackCount++;
+    if (rxCallbackCount === 1) {
+      log('RX: pipeline active, sr=' + sr +
+          ' freqs: START=' + FREQ_START + ' STOP=' + FREQ_STOP + ' ACK=' + FREQ_ACK +
+          ' carriers=[' + carrierFreqs.join(',') + ']');
     }
-    if (peakVal < DETECT_THRESHOLD) return null;
-    return interpolatePeak(data, peakBin, bufLen, sampleRate);
-  }
-
-  function detectTones(data, bufLen, sampleRate) {
-    let marker = null, chA = null, chB = null, chC = null;
-
-    // Marker band (bandBase+1650 – bandBase+1950)
-    const mFreq = findPeak(data, bufLen, bandBase + 1650, bandBase + 1950, sampleRate);
-    if (mFreq !== null) {
-      if (Math.abs(mFreq - FREQ_ACK)   < FREQ_TOLERANCE) marker = 'ACK';
-      else if (Math.abs(mFreq - FREQ_START) < FREQ_TOLERANCE) marker = 'START';
-      else if (Math.abs(mFreq - FREQ_STOP)  < FREQ_TOLERANCE) marker = 'STOP';
+    if (rxCallbackCount % 120 === 0) {
+      let peak = 0;
+      for (let i = 0; i < count; i++) {
+        const abs = Math.abs(newSamples[i]);
+        if (abs > peak) peak = abs;
+      }
+      log('RX heartbeat: state=' + rxStateLabel + ' buf=' + rxSampleCount +
+          ' fed=' + count + ' peak=' + peak.toFixed(5));
     }
 
-    // Channel A (bandBase+2000 – bandBase+3500)
-    const aFreq = findPeak(data, bufLen, bandBase + 1950, bandBase + 3550, sampleRate);
-    if (aFreq !== null) {
-      for (let n = 0; n < NUM_NIBBLES; n++) {
-        if (Math.abs(aFreq - nibbleToFreqA(n)) < FREQ_TOLERANCE) { chA = n; break; }
+    // Append new samples to accumulation buffer
+    if (rxSampleCount + count > rxSampleBuf.length) {
+      const newSize = Math.max(rxSampleCount + count, rxSampleBuf.length * 2, sr * 2);
+      const newBuf = new Float32Array(newSize);
+      if (rxSampleCount > 0) newBuf.set(rxSampleBuf.subarray(0, rxSampleCount));
+      rxSampleBuf = newBuf;
+    }
+    // Copy only 'count' samples (newSamples may be larger buffer)
+    for (let i = 0; i < count; i++) {
+      rxSampleBuf[rxSampleCount + i] = newSamples[i];
+    }
+    rxSampleCount += count;
+
+    // Precompute timing in samples
+    symbolSamples = Math.round(sr * SYMBOL_MS / 1000);
+    gapSamples    = Math.round(sr * GAP_MS / 1000);
+    markerSamples = Math.round(sr * MARKER_MS / 1000);
+
+    const analysisBlock = Math.round(sr * 0.02); // 20ms blocks for Goertzel
+
+    switch (rxState) {
+      case RX_IDLE:
+        processIdle(sr, analysisBlock);
+        break;
+      case RX_SYNC:
+        processSync(sr);
+        break;
+      case RX_REFERENCE:
+        processReference(sr);
+        break;
+      case RX_DATA:
+        processData(sr, analysisBlock);
+        break;
+    }
+
+    // Prevent unbounded buffer growth in IDLE
+    if (rxState === RX_IDLE && rxSampleCount > sr * 2) {
+      const keep = Math.round(sr * 0.5);
+      if (rxSampleCount > keep) {
+        rxSampleBuf.copyWithin(0, rxSampleCount - keep, rxSampleCount);
+        rxSampleCount = keep;
       }
     }
-
-    // Channel B (bandBase – bandBase+1500)
-    const bFreq = findPeak(data, bufLen, bandBase - 50, bandBase + 1550, sampleRate);
-    if (bFreq !== null) {
-      for (let n = 0; n < NUM_NIBBLES; n++) {
-        if (Math.abs(bFreq - nibbleToFreqB(n)) < FREQ_TOLERANCE) { chB = n; break; }
-      }
-    }
-
-    // Channel C (bandBase-2000 – bandBase-500)
-    const cFreq = findPeak(data, bufLen, bandBase - 2050, bandBase - 450, sampleRate);
-    if (cFreq !== null) {
-      for (let n = 0; n < NUM_NIBBLES; n++) {
-        if (Math.abs(cFreq - nibbleToFreqC(n)) < FREQ_TOLERANCE) { chC = n; break; }
-      }
-    }
-
-    return { marker, chA, chB, chC };
   }
 
-  function processTones({ marker, chA, chB, chC }) {
-    // Real markers are single tones; during data slots the active channels
-    // are present. If the expected data channels are active, suppress false markers.
-    const dataPresent = (toneCount === 1 && chA !== null) ||
-                        (toneCount >= 2 && chA !== null && chB !== null);
-    if (marker !== null && dataPresent) {
-      marker = null;
+  function processIdle(sr, blockSize) {
+    // Process in overlapping blocks (50% overlap for better marker edge detection)
+    const stride = Math.floor(blockSize / 2);
+    while (rxSampleCount >= blockSize) {
+      const result = detectMarker(rxSampleBuf, 0, blockSize, sr);
+      const marker = result ? result.type : null;
+
+      // Periodic diagnostic logging (every ~0.5s)
+      const now = performance.now();
+      if (now - idleLogTimer > 500) {
+        idleLogTimer = now;
+        // Always log magnitudes so we can see what the mic is picking up
+        const s = goertzel(rxSampleBuf, 0, blockSize, FREQ_START, sr);
+        const p = goertzel(rxSampleBuf, 0, blockSize, FREQ_STOP, sr);
+        const a = goertzel(rxSampleBuf, 0, blockSize, FREQ_ACK, sr);
+        // Also measure carrier energy
+        let cMax = 0;
+        for (let c = 0; c < numCarriers; c++) {
+          const cm = goertzel(rxSampleBuf, 0, blockSize, carrierFreqs[c], sr);
+          if (cm > cMax) cMax = cm;
+        }
+        const n1 = goertzel(rxSampleBuf, 0, blockSize, FREQ_START - 500, sr);
+        const thr = result ? result.thr : Math.max(0.003, n1 * 3);
+        log('RX idle: S=' + s.toFixed(5) + ' P=' + p.toFixed(5) + ' A=' + a.toFixed(5) +
+            ' C=' + cMax.toFixed(5) + ' thr=' + thr.toFixed(5) +
+            (result ? ' -> ' + result.type : '') +
+            ' cnt=' + markerDetectCount);
+      }
+
+      if (marker === 'ACK') {
+        if (waitingForAck) {
+          ackCount++;
+          if (lastSentMsgEl) {
+            const meta = lastSentMsgEl.querySelector('.meta');
+            meta.textContent = meta.textContent.replace(/ — awaiting ACK\.\.\.$| — ACK \(\d+\)$/, '')
+              + ' — ACK (' + ackCount + ')';
+            meta.classList.add('acked');
+          }
+          log('TX: ACK #' + ackCount + ' received (mag=' + result.mag.toFixed(4) + ')');
+        }
+        consumeSamples(blockSize);
+        markerDetectCount = 0;
+        continue;
+      }
+
+      if (marker === 'START') {
+        markerDetectCount++;
+        if (markerDetectCount >= MARKER_CONFIRM) {
+          // START confirmed — transition to SYNC
+          rxState = RX_SYNC;
+          rxStateLabel = 'SYNC';
+          rxDibits = [];
+          prevPhases = [];
+          rxStartTime = performance.now();
+          rxSyncEnterSampleCount = 0;
+          markerDetectCount = 0;
+          log('RX: START detected (mag=' + result.mag.toFixed(4) + ' thr=' + result.thr.toFixed(4) + ')');
+          setStatus('Receiving...', 'sending');
+          showProgress('Receiving...', 'rx-pulse');
+          updateProgress(0, '0 bytes');
+          consumeSamples(blockSize);
+          return;
+        }
+      } else {
+        markerDetectCount = 0;
+      }
+
+      consumeSamples(stride); // advance by half-block for overlap
     }
+  }
 
-    const anySignal = (marker !== null || chA !== null || chB !== null || chC !== null);
+  function processSync(sr) {
+    // Wait through the remainder of the START marker and the silence gap
+    // until the reference symbol begins (carrier energy appears).
+    //
+    // TX structure: START(100ms) | GAP(50ms) | REF(60ms) | DATA...
+    // START is detected ~30ms in, so ~70ms of marker + 50ms gap = ~120ms to skip.
+    // The reference symbol is 3x symbol duration (60ms) so we have margin.
+    //
+    // Strategy: consume 5ms blocks while marker is present or silence.
+    // When carriers appear WITHOUT marker → DON'T consume, transition to REF.
+    const checkBlock = Math.round(sr * 0.005); // 5ms check blocks
+    while (rxSampleCount >= checkBlock) {
+      const startMag = goertzel(rxSampleBuf, 0, checkBlock, FREQ_START, sr);
+      const isMarker = startMag > 0.0005;
+      const hasCarriers = carriersPresent(rxSampleBuf, 0, checkBlock, sr);
 
-    if (!anySignal) {
-      markerConfirm = 0; lastMarker = null;
-      triConfirm = 0; lastTriA = null; lastTriB = null; lastTriC = null;
+      if (hasCarriers && !isMarker) {
+        // Carriers detected, marker gone — we're at the reference symbol.
+        // Do NOT consume this block — leave it for REFERENCE to use.
+        rxState = RX_REFERENCE;
+        rxStateLabel = 'REF';
+        log('RX: SYNC complete after ' + (rxSyncEnterSampleCount / sr * 1000).toFixed(0) +
+            'ms, carriers detected, starting reference capture');
+        return;
+      }
 
-      // Time-based silence timeout (2 seconds)
-      if (rxState === RX_RECEIVING && (performance.now() - lastSignalTime) > 2000) {
+      // Still in marker or gap — consume and keep waiting
+      rxSyncEnterSampleCount += checkBlock;
+      consumeSamples(checkBlock);
+
+      // Safety: if we've waited too long (>500ms), force transition
+      if (rxSyncEnterSampleCount > sr * 0.5) {
+        rxState = RX_REFERENCE;
+        rxStateLabel = 'REF';
+        log('RX: SYNC timeout after 500ms, forcing reference capture');
+        return;
+      }
+    }
+  }
+
+  function processReference(sr) {
+    // The TX reference symbol is 3x symbol duration (60ms).
+    // We need 2x symbolSamples: skip the first (may be contaminated by
+    // gap/marker tail), measure the second (clean reference).
+    // The third symbolSamples provides margin before data starts.
+    const needed = symbolSamples * 2;
+    if (rxSampleCount >= needed) {
+      // Skip first symbol period (possibly contaminated)
+      // Measure phase from the second symbol period (clean)
+      prevPhases = [];
+      for (let c = 0; c < numCarriers; c++) {
+        prevPhases.push(measurePhase(rxSampleBuf, symbolSamples, symbolSamples, carrierFreqs[c], sr));
+      }
+      // Consume 2 symbol periods. The 3rd period of the reference
+      // will be consumed as the first "data" symbol in processData,
+      // but since it has the same phase as the reference (no jump),
+      // it will decode as dibit 00 for all carriers. We need to
+      // skip this too — consume all 3 periods of the reference.
+      const refTotal = symbolSamples * 3;
+      if (rxSampleCount >= refTotal) {
+        consumeSamples(refTotal);
+      } else {
+        consumeSamples(needed);
+      }
+      rxState = RX_DATA;
+      rxStateLabel = 'DATA';
+      log('RX: Reference captured (phases: ' +
+          prevPhases.map(p => (p * 180 / Math.PI).toFixed(0) + '°').join(', ') + ')');
+    }
+  }
+
+  let dataGapSamples = 0; // count consecutive silent samples in DATA state
+
+  function processData(sr, blockSize) {
+    // Process symbol-by-symbol
+    while (rxSampleCount >= symbolSamples) {
+      const checkLen = symbolSamples;
+
+      // Check for STOP marker
+      const markerResult = detectMarker(rxSampleBuf, 0, checkLen, sr);
+      if (markerResult && markerResult.type === 'STOP') {
+        log('RX: STOP detected after ' + rxDibits.length + ' dibits (mag=' + markerResult.mag.toFixed(4) + ')');
+        consumeSamples(checkLen);
+        dataGapSamples = 0;
         flushReceived();
-      }
-      return;
-    }
-
-    lastSignalTime = performance.now();
-
-    // ── Marker confirmation ──
-    if (marker !== null) {
-      if (marker === lastMarker) {
-        markerConfirm++;
-      } else {
-        lastMarker = marker;
-        markerConfirm = 1;
-      }
-
-      if (markerConfirm === CONFIRM_FRAMES) {
-        if (marker === 'ACK') {
-          if (waitingForAck) {
-            ackCount++;
-            if (lastSentMsgEl) {
-              const meta = lastSentMsgEl.querySelector('.meta');
-              meta.textContent = meta.textContent.replace(/ — awaiting ACK\.\.\.$| — ACK \(\d+\)$/, '')
-                + ' — ACK (' + ackCount + ')';
-              meta.classList.add('acked');
-            }
-            log('TX: ACK #' + ackCount + ' received');
-          }
-        } else if (!isSending) {
-          if (marker === 'START' && rxState === RX_IDLE) {
-            rxState = RX_RECEIVING;
-            rxNibbles = [];
-            rxStartTime = performance.now();
-            log('RX: START detected');
-            setStatus('Receiving...', 'sending');
-          } else if (marker === 'STOP' && rxState === RX_RECEIVING) {
-            flushReceived();
-          }
-        }
-        markerConfirm = CONFIRM_FRAMES + 100;
-        return;
-      }
-    } else {
-      markerConfirm = 0;
-      lastMarker = null;
-    }
-
-    // ── Multi-channel data confirmation ──
-    if (isSending) return;
-
-    const tc = toneCount;
-    const slotOk = (tc === 1 && chA !== null) ||
-                   (tc === 2 && chA !== null && chB !== null) ||
-                   (tc === 3 && chA !== null && chB !== null && chC !== null);
-
-    if (slotOk) {
-      const curA = chA, curB = (tc >= 2 ? chB : 0), curC = (tc >= 3 ? chC : 0);
-      if (curA === lastTriA && curB === lastTriB && curC === lastTriC) {
-        triConfirm++;
-      } else {
-        lastTriA = curA;
-        lastTriB = curB;
-        lastTriC = curC;
-        triConfirm = 1;
         return;
       }
 
-      if (triConfirm === CONFIRM_FRAMES) {
-        if (rxState === RX_RECEIVING) {
-          rxNibbles.push(curA);
-          if (tc >= 2) rxNibbles.push(curB);
-          if (tc >= 3) rxNibbles.push(curC);
-          log('RX slot: ' + curA.toString(16) +
-              (tc >= 2 ? ' ' + curB.toString(16) : '') +
-              (tc >= 3 ? ' ' + curC.toString(16) : ''));
+      // Check if carriers are present
+      const hasCarriers = carriersPresent(rxSampleBuf, 0, checkLen, sr);
+
+      if (!hasCarriers) {
+        // No carrier energy — likely in pre-STOP gap or STOP marker
+        dataGapSamples += checkLen;
+        consumeSamples(checkLen);
+
+        // Keep scanning for STOP in subsequent blocks
+        const maxGapMs = 200; // max silence before force-flush
+        if (dataGapSamples > sr * maxGapMs / 1000) {
+          log('RX: silence timeout (' + maxGapMs + 'ms), flushing ' + rxDibits.length + ' dibits');
+          dataGapSamples = 0;
+          flushReceived();
+          return;
         }
-        triConfirm = CONFIRM_FRAMES + 100;
+        continue; // keep consuming, looking for STOP
       }
+
+      // Carriers present — decode a data symbol
+      dataGapSamples = 0;
+
+      const symbolDibits = [];
+      const newPhases = [];
+      for (let c = 0; c < numCarriers; c++) {
+        const phase = measurePhase(rxSampleBuf, 0, symbolSamples, carrierFreqs[c], sr);
+        const diff = phase - prevPhases[c];
+        symbolDibits.push(phaseDiffToDibit(diff));
+        newPhases.push(phase);
+      }
+      prevPhases = newPhases;
+
+      for (let c = 0; c < numCarriers; c++) {
+        rxDibits.push(symbolDibits[c]);
+      }
+
+      const rxBytesSoFar = Math.floor(rxDibits.length / 4);
+      const rxPct = Math.min(95, rxBytesSoFar * 3);
+      updateProgress(rxPct, rxBytesSoFar + ' bytes');
+      lastDibitStr = symbolDibits.map(d => d.toString(2).padStart(2, '0')).join(' ');
+
+      consumeSamples(symbolSamples);
+    }
+  }
+
+  function consumeSamples(count) {
+    if (count >= rxSampleCount) {
+      rxSampleCount = 0;
     } else {
-      triConfirm = 0;
-      lastTriA = null;
-      lastTriB = null;
-      lastTriC = null;
+      // Shift remaining data to front (in-place, no allocation)
+      rxSampleBuf.copyWithin(0, count, rxSampleCount);
+      rxSampleCount -= count;
     }
   }
 
   function flushReceived() {
     rxState = RX_IDLE;
+    rxStateLabel = 'IDLE';
+    dataGapSamples = 0;
     setStatus(isListening ? 'Listening' : 'Idle', isListening ? 'listening' : '');
+    updateProgress(100, 'Done');
+    setTimeout(hideProgress, 600);
 
-    log('RX: flush — ' + rxNibbles.length + ' nibbles received');
+    log('RX: flush — ' + rxDibits.length + ' dibits received');
 
-    // Reassemble nibbles into bytes (every 2 nibbles = 1 byte)
-    // Discard any trailing odd nibble (padding)
+    // Convert dibits to bytes: 4 dibits = 8 bits = 1 byte
     const rxBytes = [];
-    for (let i = 0; i + 1 < rxNibbles.length; i += 2) {
-      rxBytes.push((rxNibbles[i] << 4) | rxNibbles[i + 1]);
+    for (let i = 0; i + 3 < rxDibits.length; i += 4) {
+      const b = (rxDibits[i] << 6) | (rxDibits[i + 1] << 4) | (rxDibits[i + 2] << 2) | rxDibits[i + 3];
+      rxBytes.push(b);
     }
 
     // Need at least 1 data byte + 1 CRC byte
     if (rxBytes.length < 2) {
       log('RX: too few bytes (' + rxBytes.length + '), discarding');
-      rxNibbles = [];
+      rxDibits = [];
       return;
     }
 
@@ -1298,7 +1420,7 @@
       addMessage('[Decode error: ' + e.message + ']', 'received');
     }
 
-    rxNibbles = [];
+    rxDibits = [];
 
     if (hashMatch) {
       sendAck();
@@ -1306,7 +1428,6 @@
   }
 
   async function sendAck() {
-    // Random delay so multiple receivers stagger their ACKs
     const delay = 500 + Math.floor(Math.random() * 1500);
     log('RX: Sending ACK in ' + delay + 'ms...');
     await silence(delay);
@@ -1314,7 +1435,137 @@
     log('RX: ACK sent');
   }
 
-  // ── Spectrum Visualizer ──
+  // ── Microphone & Reception ──
+  async function startListening() {
+    try {
+      ensureAudioCtx();
+
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+          sampleRate: SAMPLE_RATE
+        }
+      });
+
+      micSource = audioCtx.createMediaStreamSource(micStream);
+
+      // AnalyserNode for BOTH visualization AND RX sample extraction.
+      // Use fftSize=4096 to get ~93ms of time-domain data per poll.
+      // The RX pipeline is driven from pollSpectrum (requestAnimationFrame)
+      // which extracts new samples from the AnalyserNode each frame.
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 4096;
+      analyser.smoothingTimeConstant = 0.25;
+      micSource.connect(analyser);
+
+      timeDomainBuf = new Float32Array(analyser.fftSize);
+      lastPollTime = performance.now();
+
+      isListening = true;
+      rxState = RX_IDLE;
+      rxStateLabel = 'IDLE';
+      rxDibits = [];
+      rxSampleBuf = new Float32Array(0);
+      rxSampleCount = 0;
+      prevPhases = [];
+      markerDetectCount = 0;
+      dataGapSamples = 0;
+      rxSyncEnterSampleCount = 0;
+      idleLogTimer = 0;
+      rxCallbackCount = 0;
+
+      btnListen.disabled = true;
+      btnStop.disabled = false;
+      setStatus('Listening', 'listening');
+      log('Listening started: DQPSK ' + numCarriers + ' carriers, sr=' + audioCtx.sampleRate +
+          ', band=' + bandBase + 'Hz, START=' + FREQ_START + ' STOP=' + FREQ_STOP +
+          ', carriers=[' + carrierFreqs.join(', ') + ']');
+
+      pollSpectrum();
+    } catch (e) {
+      log('Mic error: ' + e.message);
+      alert('Microphone access denied or unavailable.\n' + e.message);
+    }
+  }
+
+  function stopListening() {
+    isListening = false;
+    waitingForAck = false;
+    ackCount = 0;
+    if (ackTimeout) { clearTimeout(ackTimeout); ackTimeout = null; }
+    if (micSource) {
+      micSource.disconnect();
+      micSource = null;
+    }
+    if (micStream) {
+      micStream.getTracks().forEach(t => t.stop());
+      micStream = null;
+    }
+    if (animFrameId) {
+      cancelAnimationFrame(animFrameId);
+      animFrameId = null;
+    }
+    analyser = null;
+    timeDomainBuf = null;
+    rxState = RX_IDLE;
+    rxStateLabel = 'IDLE';
+    rxDibits = [];
+    rxSampleBuf = new Float32Array(0);
+    rxSampleCount = 0;
+    dataGapSamples = 0;
+    rxSyncEnterSampleCount = 0;
+
+    btnListen.disabled = false;
+    btnStop.disabled = true;
+    setStatus('Idle', '');
+    log('Listening stopped');
+  }
+
+  // ── Spectrum Visualizer + RX sample extraction ──
+  // The AnalyserNode provides BOTH frequency data (for the visualizer)
+  // and time-domain data (for the RX pipeline). We poll both in the
+  // same requestAnimationFrame loop.
+  //
+  // getFloatTimeDomainData() returns the most recent fftSize samples.
+  // Between frames (~16ms at 60fps), approximately sr*0.016 ≈ 706
+  // new samples arrive. We estimate new samples from elapsed time
+  // and take them from the END of the time-domain buffer (most recent).
+  function pollSpectrum() {
+    if (!isListening || !analyser) return;
+    const sr = audioCtx.sampleRate;
+
+    // ── Visualization ──
+    const bufLen = analyser.frequencyBinCount;
+    const dataArray = new Uint8Array(bufLen);
+    analyser.getByteFrequencyData(dataArray);
+    drawSpectrum(dataArray, bufLen, sr);
+
+    // ── RX sample extraction ──
+    if (timeDomainBuf) {
+      analyser.getFloatTimeDomainData(timeDomainBuf);
+
+      const now = performance.now();
+      const elapsedMs = Math.min(now - lastPollTime, 100); // cap at 100ms
+      lastPollTime = now;
+
+      // Estimate how many new samples arrived since last poll
+      const newSampleCount = Math.min(
+        Math.round(sr * elapsedMs / 1000),
+        timeDomainBuf.length
+      );
+
+      if (newSampleCount > 0) {
+        // New samples are at the END of the time-domain buffer
+        const offset = timeDomainBuf.length - newSampleCount;
+        feedRxSamples(timeDomainBuf.subarray(offset), newSampleCount);
+      }
+    }
+
+    animFrameId = requestAnimationFrame(pollSpectrum);
+  }
+
   function drawSpectrum(data, bufLen, sampleRate) {
     const dpr = window.devicePixelRatio || 1;
     const w = canvas.clientWidth;
@@ -1327,62 +1578,66 @@
     }
 
     ctx.clearRect(0, 0, w, h);
-
     ctx.fillStyle = '#0d1117';
     ctx.fillRect(0, 0, w, h);
 
-    // Draw full band (bandBase-2100 to bandBase+3600)
-    const binLow  = freqToBin(bandBase - 2100, FFT_SIZE, sampleRate);
-    const binHigh = freqToBin(bandBase + 3600, FFT_SIZE, sampleRate);
-    const numBins = binHigh - binLow + 1;
-    const barW = w / numBins;
+    // Display range: from markers (below carriers) to highest carrier + margin
+    const freqLow  = FREQ_START - 400;
+    const freqHigh = carrierFreqs[numCarriers - 1] + 400;
+    const binLow   = Math.max(0, freqToBin(freqLow, FFT_SIZE, sampleRate));
+    const binHigh  = Math.min(bufLen - 1, freqToBin(freqHigh, FFT_SIZE, sampleRate));
+    const numBins  = binHigh - binLow + 1;
+    const barW     = w / numBins;
 
-    const chCTop   = bandBase - 450;
-    const chBTop   = bandBase + 1550;
-    const markerTop = bandBase + 2000;
+    // Carrier hue rotation
+    const carrierHues = [140, 200, 280, 50, 330, 30, 170, 100]; // up to 8
 
     for (let i = 0; i < numBins; i++) {
       const bin = binLow + i;
       if (bin < 0 || bin >= bufLen) continue;
       const val = data[bin] / 255;
       const barH = val * h;
-
       const freq = binToFreq(bin, FFT_SIZE, sampleRate);
+
       let color;
-      if (freq < chCTop) {
-        // Channel C (purple)
-        color = `hsla(280, 80%, ${30 + val * 40}%, ${0.4 + val * 0.6})`;
-      } else if (freq < chBTop) {
-        // Channel B (orange) + gap between C and B
-        color = (freq >= bandBase - 50) ?
-          `hsla(30, 90%, ${30 + val * 40}%, ${0.4 + val * 0.6})` :
-          `rgba(50, 50, 80, ${0.2 + val * 0.3})`;
-      } else if (freq < markerTop) {
-        // Markers (blue)
-        color = `rgba(0, 150, 255, ${0.3 + val * 0.7})`;
-      } else {
-        // Channel A (green)
-        color = `hsla(140, 80%, ${30 + val * 40}%, ${0.4 + val * 0.6})`;
+      let isCarrier = false;
+      for (let c = 0; c < numCarriers; c++) {
+        if (Math.abs(freq - carrierFreqs[c]) < CARRIER_SPACING * 0.4) {
+          const hue = carrierHues[c % carrierHues.length];
+          color = 'hsla(' + hue + ', 80%, ' + (30 + val * 40) + '%, ' + (0.4 + val * 0.6) + ')';
+          isCarrier = true;
+          break;
+        }
+      }
+
+      if (!isCarrier) {
+        // Check if it's in the marker range (markers are below carriers)
+        const markerLo = FREQ_START - 100;
+        const markerHi = FREQ_ACK + 100;
+        if (freq >= markerLo && freq <= markerHi) {
+          color = 'rgba(0, 150, 255, ' + (0.3 + val * 0.7) + ')';
+        } else {
+          color = 'rgba(50, 50, 80, ' + (0.2 + val * 0.3) + ')';
+        }
       }
 
       ctx.fillStyle = color;
       ctx.fillRect(i * barW, h - barH, barW - 0.5, barH);
     }
 
-    // Overlay: detected tone labels
-    if ((performance.now() - lastSignalTime) < 100) {
-      ctx.fillStyle = 'rgba(255,255,255,0.85)';
-      ctx.font = '11px monospace';
-      const labels = [];
-      if (lastMarker !== null && markerConfirm >= 1) labels.push(lastMarker);
-      if (lastTriA !== null && triConfirm >= 1) {
-        let s = lastTriA.toString(16);
-        if (toneCount >= 2 && lastTriB !== null) s += '.' + lastTriB.toString(16);
-        if (toneCount >= 3 && lastTriC !== null) s += '.' + lastTriC.toString(16);
-        labels.push(s);
-      }
-      if (labels.length) ctx.fillText(labels.join(' | '), 6, 14);
+    // Draw carrier frequency tick marks at bottom
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.3)';
+    for (let c = 0; c < numCarriers; c++) {
+      const x = ((freqToBin(carrierFreqs[c], FFT_SIZE, sampleRate) - binLow) / numBins) * w;
+      ctx.fillRect(x - 0.5, h - 3, 1, 3);
     }
+
+    // Overlay: RX state and decoded dibit
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.font = '11px monospace';
+    const overlayParts = [rxStateLabel];
+    if (lastDibitStr && rxState === RX_DATA) overlayParts.push(lastDibitStr);
+    ctx.fillText(overlayParts.join(' | '), 6, 14);
   }
 
   // ── Event Handlers ──
@@ -1390,13 +1645,14 @@
   bandSelect.addEventListener('change', () => {
     const base = parseInt(bandSelect.value, 10);
     applyBand(base);
-    log('Band changed to ' + (base / 1000) + '–' + ((base + 3500) / 1000) + ' kHz');
+    log('Band changed to ' + (base / 1000) + ' kHz base');
   });
 
-  const toneSelect = document.getElementById('toneSelect');
-  toneSelect.addEventListener('change', () => {
-    toneCount = parseInt(toneSelect.value, 10);
-    log('Tone count changed to ' + toneCount);
+  const carrierSelect = document.getElementById('carrierSelect');
+  carrierSelect.addEventListener('change', () => {
+    numCarriers = parseInt(carrierSelect.value, 10);
+    recomputeFreqs();
+    log('Carriers changed to ' + numCarriers);
   });
 
   btnSend.addEventListener('click', () => {
@@ -1441,7 +1697,7 @@
   }
 
   drawEmpty();
-  log('Ready. Click "Start Listening" to begin.');
+  log('Ready (DQPSK mode). Click "Start Listening" to begin.');
 })();
 </script>
 </body>
